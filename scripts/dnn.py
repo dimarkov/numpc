@@ -19,6 +19,7 @@ import numpyro
 import numpyro.distributions as dist
 from numpyro.infer import SVI, Trace_ELBO, TraceMeanField_ELBO, Predictive
 from numpyro.infer.autoguide import AutoDelta, AutoNormal
+from numpyro.contrib.module import flax_module
 
 from numpc.datasets import MNIST
 
@@ -37,22 +38,17 @@ class DenseNet(fnn.Module):
     x = fnn.relu(x)
     x = fnn.Dense(features=self.features[2])(x)
 
-    return fnn.relu(x)
+    return x
 
 
-def model(nnet, init_params, images, sigma=1., labels=None, subsample_size=None):
-    n, _ = images.shape
+def model(images, sigma=1., labels=None, subsample_size=None):
+    n, d = images.shape
 
-    params = defaultdict(lambda: {})
-    for key1 in init_params:
-        for key2 in init_params[key1]:
-            params[key1][key2] = numpyro.param(key1 + '-' + key2, init_params[key1][key2])
-
-    numpyro.deterministic('params', params)
+    nnet = flax_module("nnet", DenseNet([300, 100, 10]), input_shape=(1, d))
 
     with numpyro.plate("N", n, subsample_size=subsample_size):
         batch_x = numpyro.subsample(images, event_dim=1)
-        pred = nnet.apply({'params': FrozenDict(params)}, batch_x)
+        pred = nnet(batch_x) #nnet.apply({'params': FrozenDict(params)}, batch_x)
         if labels is not None:
             batch_y = numpyro.subsample(labels, event_dim=1)
         else:
@@ -71,10 +67,6 @@ train_ds, test_ds = MNIST()
 train_ds['image'] = train_ds['image'].reshape(train_ds['image'].shape[0], -1)
 test_ds['image'] = test_ds['image'].reshape(test_ds['image'].shape[0], -1)
 
-# create network
-dnn = DenseNet(features=[300, 100, 10])
-init_params = dnn.init(random.PRNGKey(0), train_ds['image'] )['params']
-
 guide = AutoDelta(model)
 optimizer = numpyro.optim.Adam(step_size=1e-4)
 
@@ -83,8 +75,6 @@ rng_key, _rng_key = random.split(rng_key)
 svi_result = svi.run(
     _rng_key, 
     30000, 
-    dnn, 
-    init_params, 
     train_ds['image'], 
     labels=nn.one_hot(train_ds['label'], 10), 
     subsample_size=64)
@@ -92,7 +82,7 @@ svi_result = svi.run(
 params, losses = svi_result.params, svi_result.losses
 
 pred = Predictive(model, params=params, num_samples=1)
-sample = pred(_rng_key, dnn, init_params, test_ds['image'], sigma=1e-6)
+sample = pred(_rng_key, test_ds['image'], sigma=1e-6)
 
 acc = np.mean( sample['obs'][0].argmax(-1) == test_ds['label'] )
 print('model acc :', acc)
