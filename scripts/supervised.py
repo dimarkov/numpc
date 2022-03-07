@@ -1,10 +1,4 @@
-# set environment for better memory menagment on gpu
-import os
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
-######################################################
-
-from tqdm import tqdm
+import tqdm
 import numpy as np
 import jax.numpy as jnp
 from jax import random, nn, jit, vmap
@@ -16,12 +10,15 @@ from collections import defaultdict
 
 import numpyro
 import numpyro.distributions as dist
-from numpyro.infer import SVI, Trace_ELBO, TraceMeanField_ELBO
+from numpyro.infer import SVI, Trace_ELBO, TraceMeanField_ELBO, Predictive
 from numpyro.infer.autoguide import AutoDelta, AutoNormal
+from numpyro.infer.initialization import init_to_value
+from numpyro.contrib.module import flax_module
 
 from numpc.datasets import MNIST
 
 numpyro.set_platform('cpu')
+# numpyro.enable_x64()
 # numpyro.enable_validation(True)
 
 class DenseLayer(fnn.Module):
@@ -34,9 +31,24 @@ class DenseLayer(fnn.Module):
     x = fnn.relu(x)
     return x
 
-def states(nnets, params, images, labels=None, subsample_size=None):
-    n, _ = images.shape
-    L = len(params) - 1
+def network_layers(features, image_dim):
+    nnets = []
+    d = image_dim
+    L = len(features)
+    for i, f in enumerate(features):
+        nnet = flax_module('layer{}'.format(L - i - 1), DenseLayer(f), input_shape=(1, d))
+        d = f
+        nnets.append(nnet)    
+    return nnets
+
+
+def model(features, images, labels=None, subsample_size=None, likelihood='normal', sigma=1.):
+    n, d = images.shape
+
+    nnets = network_layers(features, d)
+    L = len(nnets)
+    
+    inp_par = jnp.zeros(d)
 
     with numpyro.plate('batch', n, subsample_size=subsample_size):
         if images is not None:
@@ -45,88 +57,32 @@ def states(nnets, params, images, labels=None, subsample_size=None):
             x_batch = None
 
         l = 0
-        x_out = numpyro.sample('x_{}'.format(L-l), dist.Normal(params[l]['input'], 1.).to_event(1), obs=x_batch)
+        x_out = numpyro.sample('x_{}'.format(L-l), dist.Normal(inp_par, sigma).to_event(1), obs=x_batch)
 
-        for l in range(1, L):
-            pred = nnets[l-1].apply(params[l]['loc'], x_out)
-            if l == 0:
+        for l in range(1, L + 1):
+            pred = nnets[l-1](x_out)
+            if L - l == 0:
                 if labels is not None:
                     y_batch = numpyro.subsample(labels, event_dim=1)
                 else:
                     y_batch = None
-                    numpyro.sample('x_{}'.format(L-l), dist.Normal(pred, 1.).to_event(1), obs=y_batch)
+                    if likelihood == 'normal':
+                        numpyro.sample('x_{}'.format(L-l), dist.Normal(pred, sigma).to_event(1), obs=y_batch)
+                    elif likelihood == 'categorical':
+                        numpyro.sample('x_{}'.format(L-l), dist.Categorical(logits=pred), obs=y_batch.argmax(-1))
+                    else:
+                        raise ValueError(f"Invalid choice of likelihood function.")
             else:
-                x_out = numpyro.sample('x_{}'.format(L-l), dist.Normal(pred, 1.).to_event(1))
+                x_out = numpyro.sample('x_{}'.format(L-l), dist.Normal(pred, sigma).to_event(1))
 
-def weights(mus, params, nnets):
-    L = len(mus) - 1
-    for i, p in enumerate(params):
-        if 'input' in p:
-            pass
-        else:
-            s = {}
-            for key in p['loc']['params']:
-                s[key] = {}
-                # loc_W = p[key]['kernel']
-                # loc_b = p[key]['bias']
 
-                scale_W = p['scale'][key]['kernel']
-                scale_b = p['scale'][key]['bias']
+def test_model(test_data, features, params, likelihood='normal'):
+    pred = Predictive(model, params=params, num_samples=1)
+    sample = pred(_rng_key, features, test_data['image'], sigma=1e-6, likelihood=likelihood)
 
-                s[key]['kernel'] = numpyro.sample('W_{}-'.format(L - i) + key, dist.Normal(0., scale=scale_W).to_event(2))
-                s[key]['bias'] = numpyro.sample('b_{}-'.format(L - i) + key, dist.Normal(0., scale=scale_b).to_event(1))
+    pred_label = sample['x_0'][0]
 
-            pred = nnets[i-1].apply( {'params': s}, mus['x_{}'.format(L - i + 1)] )
-            with numpyro.plate('batch_{}'.format(i), pred.shape[0]):
-                numpyro.sample('mu_{}'.format(L - i), dist.Normal(pred, 1.).to_event(1), obs=mus['x_{}'.format(L - i)])
-
-def infer_states(rng_key, data, params, nnets, subsample_size=64, num_iters=100):
-    optimizer = numpyro.optim.SGD(step_size=1e-2)
-    guide = AutoDelta(states)
-    svi = SVI(states, guide, optimizer, loss=Trace_ELBO(num_particles=1))
-    svi_result = svi.run(rng_key, num_iters, nnets, params, data['image'], data['label'], subsample_size=subsample_size, progress_bar=False)
-
-    mus = {'x_3': data['image']}
-    for i in range(n_layers-1, 0, -1):
-        mus['x_{}'.format(i)] = svi_result.params['x_{}_auto_loc'.format(i)]
-    
-    mus['x_0'] = nn.one_hot(data['label'], 10)
-
-    return mus
-
-def format_parameters(params):
-    locs = defaultdict(lambda: defaultdict(lambda: {}))
-    # scl = {}
-    for (key, value) in params.items():
-        s1, s2 = key.split('-')
-        k = s2.split('_')
-        layer_name = k[0] + '_' + k[1]
-        label, layer = s1.split('_')
-
-        # scl[s2] = {'kernel': None, 'bias': None}
-        if label == 'W':
-            locs[layer][layer_name]['kernel'] = value
-            # scl[k]['kernel'] = value.std(0, ddof=1)
-        elif label == 'b':
-            locs[layer][layer_name]['bias'] = value
-            # scl[k]['bias'] = value.std(0, ddof=1)
-
-    return locs
-
-def learn_parameters(rng_key, mus, params, nnets, num_iters=100):
-    optimizer = numpyro.optim.Adam(step_size=1e-4)
-    guide = AutoDelta(weights)
-    svi = SVI(weights, guide, optimizer, loss=Trace_ELBO(num_particles=1))
-    svi_result = svi.run(rng_key, num_iters, mus, params, nnets, progress_bar=False)
-
-    return format_parameters(svi_result.params)
-
-def test_model(rng_key, test_data, params, nnets):
-    x = test_data['image']
-    for i, nnet in enumerate(nnets):
-        x = nnet.apply(params[i + 1]['loc'], x)
-
-    print('model acc :', np.mean(x.argmax(-1) == test_data['label']))
+    return np.mean(pred_label.argmax(-1) == test_data['label'])
 
 # load data
 train_ds, test_ds = MNIST()
@@ -135,42 +91,39 @@ train_ds, test_ds = MNIST()
 train_ds['image'] = train_ds['image'].reshape(train_ds['image'].shape[0], -1)
 test_ds['image'] = test_ds['image'].reshape(test_ds['image'].shape[0], -1)
 
-####################### initialise network parameters #############
+
 rng_key = random.PRNGKey(0)
-x_init = train_ds['image'][0]
+batch_size = 64
 features = [300, 100, 10]
-n_layers = len(features)
+with numpyro.handlers.seed(rng_seed=1):
+    model(features, train_ds['image'], labels=train_ds['label'], subsample_size=batch_size)
 
-nnets = []
-params= [{'input': jnp.zeros(x_init.shape[-1])}]
-for l, f in enumerate(features):
-    nnet = DenseLayer(features=f)
-    rng_key, _rng_key = random.split(rng_key)
-    init_params = nnet.init(_rng_key, x_init)
-    x_init = nnet.apply(init_params, x_init)
-    nnets.append(nnet)
-    params.append({'loc': init_params})
-    p = init_params['params']
-    scl = {}
-    for key in p:
-        scl[key] = {
-                'kernel': 1e1 * jnp.ones_like(p[key]['kernel']), 
-                'bias': 1e1 * jnp.ones_like(p[key]['bias']) 
-        }
-    params[-1]['scale'] = scl
-####################################################################
+guide = AutoDelta(model)
+optimizer = numpyro.optim.ClippedAdam(step_size=1e-2, clip_norm=50.)
+svi = SVI(model, guide, optimizer, loss=Trace_ELBO(num_particles=1))
 
-for i in tqdm(range(30)):
-  
-    rng_key, _rng_key = random.split(rng_key)
-    mus = infer_states(_rng_key, train_ds, params, nnets, num_iters=1000, subsample_size=64)
+epochs = 30
+num_iters = 1000
+init_state = None
+with tqdm.trange(epochs) as t:
+    for _ in t:
+        rng_key, _rng_key = random.split(rng_key)
+        svi_result = svi.run(
+            _rng_key, 
+            num_iters, 
+            features,
+            train_ds['image'],
+            progress_bar=False,
+            init_state=init_state,
+            labels=train_ds['label'],
+            subsample_size=batch_size,
+            likelihood='normal'
+        )
+        init_state = svi_result.state
 
-    rng_key, _rng_key = random.split(rng_key)
-    results = learn_parameters(_rng_key, mus, params, nnets, num_iters=100)
-
-    for s in results:
-        i = int(s)
-        params[-1 - i]['loc'] = FrozenDict({'params': results[s]})
+        acc = test_model(test_ds, features, svi_result.params, likelihood='normal')
         
-    rng_key, _rng_key = random.split(rng_key)
-    test_model(_rng_key, test_ds, params, nnets)
+        t.set_postfix_str(
+            "model elbo: {:.4f} - model test acc: {:.4f}".format(jnp.mean(svi_result.losses), acc),
+            refresh=False,
+        )
