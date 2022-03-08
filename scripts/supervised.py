@@ -1,6 +1,14 @@
+import os
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+######################################################
+
 import tqdm
 import numpy as np
 import jax.numpy as jnp
+import optax
+import jax
+
 from jax import random, nn, jit, vmap
 
 from flax import linen as fnn
@@ -17,8 +25,7 @@ from numpyro.contrib.module import flax_module
 
 from numpc.datasets import MNIST
 
-numpyro.set_platform('cpu')
-# numpyro.enable_x64()
+numpyro.set_platform('gpu')
 # numpyro.enable_validation(True)
 
 class DenseLayer(fnn.Module):
@@ -41,7 +48,6 @@ def network_layers(features, image_dim):
         nnets.append(nnet)    
     return nnets
 
-
 def model(features, images, labels=None, subsample_size=None, likelihood='normal', sigma=1.):
     n, d = images.shape
 
@@ -50,6 +56,10 @@ def model(features, images, labels=None, subsample_size=None, likelihood='normal
     
     inp_par = jnp.zeros(d)
 
+    scales = []
+    for i, f in enumerate(features):
+        scales.append(numpyro.param('layer{}.scale'.format(L-i), jnp.ones(f), constraint=dist.constraints.positive))
+
     with numpyro.plate('batch', n, subsample_size=subsample_size):
         if images is not None:
             x_batch = numpyro.subsample(images, event_dim=1)
@@ -57,7 +67,7 @@ def model(features, images, labels=None, subsample_size=None, likelihood='normal
             x_batch = None
 
         l = 0
-        x_out = numpyro.sample('x_{}'.format(L-l), dist.Normal(inp_par, sigma).to_event(1), obs=x_batch)
+        x_out = numpyro.sample('x_{}'.format(L-l), dist.Normal(inp_par, 1).to_event(1), obs=x_batch)
 
         for l in range(1, L + 1):
             pred = nnets[l-1](x_out)
@@ -66,14 +76,18 @@ def model(features, images, labels=None, subsample_size=None, likelihood='normal
                     y_batch = numpyro.subsample(labels, event_dim=1)
                 else:
                     y_batch = None
-                    if likelihood == 'normal':
-                        numpyro.sample('x_{}'.format(L-l), dist.Normal(pred, sigma).to_event(1), obs=y_batch)
-                    elif likelihood == 'categorical':
+                
+                if likelihood == 'normal':
+                    numpyro.sample('x_{}'.format(L-l), dist.Normal(pred, sigma*scales[l-1]).to_event(1), obs=y_batch)
+                elif likelihood == 'categorical':
+                    if y_batch is not None:
                         numpyro.sample('x_{}'.format(L-l), dist.Categorical(logits=pred), obs=y_batch.argmax(-1))
                     else:
-                        raise ValueError(f"Invalid choice of likelihood function.")
+                        numpyro.sample('x_{}'.format(L-l), dist.Categorical(logits=pred))
+                else:
+                    raise ValueError(f"Invalid choice of likelihood function.")
             else:
-                x_out = numpyro.sample('x_{}'.format(L-l), dist.Normal(pred, sigma).to_event(1))
+                x_out = numpyro.sample('x_{}'.format(L-l), dist.Normal(pred, sigma*scales[l-1]).to_event(1))
 
 
 def test_model(test_data, features, params, likelihood='normal'):
@@ -82,7 +96,41 @@ def test_model(test_data, features, params, likelihood='normal'):
 
     pred_label = sample['x_0'][0]
 
-    return np.mean(pred_label.argmax(-1) == test_data['label'])
+    if likelihood == 'normal':
+        return np.mean(pred_label.argmax(-1) == test_data['label'])
+    else:
+        return np.mean(pred_label == test_data['label'])
+
+
+########## define optimizer #####################
+def is_nn_param_fn(params):
+    # returns dict with true or false values depending on
+    # whether parameter belongs to states or to neural networks
+    out = {}
+    for name in params:
+        if 'layer' in name:
+            out[name] = True
+        else:
+            out[name] = False
+    return out
+
+def not_nn_param_fn(params):
+    # returns dict with true or false values depending on
+    # whether parameter belongs to states or to neural networks
+    out = {}
+    for name in params:
+        if 'layer' in name:
+            out[name] = False
+        else:
+            out[name] = True
+    return out
+    
+optax_optim = optax.chain(
+    optax.masked(optax.adam(1e-2), not_nn_param_fn),
+    optax.masked(optax.chain(optax.clip(100.), optax.adam(1e-4)), is_nn_param_fn)
+)
+optimizer = numpyro.optim.optax_to_numpyro(optax_optim)
+################################################
 
 # load data
 train_ds, test_ds = MNIST()
@@ -92,19 +140,28 @@ train_ds['image'] = train_ds['image'].reshape(train_ds['image'].shape[0], -1)
 test_ds['image'] = test_ds['image'].reshape(test_ds['image'].shape[0], -1)
 
 
-rng_key = random.PRNGKey(0)
-batch_size = 64
+batch_size = 10000
 features = [300, 100, 10]
-with numpyro.handlers.seed(rng_seed=1):
-    model(features, train_ds['image'], labels=train_ds['label'], subsample_size=batch_size)
 
+ll = 'normal'
 guide = AutoDelta(model)
-optimizer = numpyro.optim.ClippedAdam(step_size=1e-2, clip_norm=50.)
 svi = SVI(model, guide, optimizer, loss=Trace_ELBO(num_particles=1))
-
-epochs = 30
-num_iters = 1000
-init_state = None
+rng_key, _rng_key = random.split(random.PRNGKey(0))
+init_state = svi.init(
+        _rng_key, 
+        features, 
+        train_ds['image'], 
+        labels=nn.one_hot(train_ds['label'], 10), 
+        subsample_size=batch_size,
+        likelihood=ll
+    )
+#Note: model parameters can be accessed with init_state.optim_state[1][0] == params
+# to initiatate 'x_1', and 'x_2' at specific values that could be done here 
+# by modifying 'x_1_auto_loc' and 'x_2_auto_loc' dictionary entries.
+ 
+epochs = 2
+num_iters = 20000
+losses = []
 with tqdm.trange(epochs) as t:
     for _ in t:
         rng_key, _rng_key = random.split(rng_key)
@@ -115,15 +172,15 @@ with tqdm.trange(epochs) as t:
             train_ds['image'],
             progress_bar=False,
             init_state=init_state,
-            labels=train_ds['label'],
+            labels=nn.one_hot(train_ds['label'], 10),
             subsample_size=batch_size,
-            likelihood='normal'
+            likelihood=ll
         )
         init_state = svi_result.state
 
-        acc = test_model(test_ds, features, svi_result.params, likelihood='normal')
-        
+        acc = test_model(test_ds, features, svi_result.params, likelihood=ll)
+        losses.append( svi_result.losses )
         t.set_postfix_str(
-            "model elbo: {:.4f} - model test acc: {:.4f}".format(jnp.mean(svi_result.losses), acc),
+            "elbo: {:.4f} - test acc: {:.4f}".format(jnp.mean(losses[-1][-1000:]), acc),
             refresh=False,
         )

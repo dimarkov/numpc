@@ -1709,7 +1709,7 @@ python-versions = "!=3.0.*,!=3.1.*,!=3.2.*,!=3.3.*,!=3.4.*,>=2.7"
 [metadata]
 lock-version = "1.1"
 python-versions = ">=3.10, <3.11"
-content-hash = "02ed410e10491e8aba534d93b5377fe86dbd994a3e99c27954c2088aca3ecd59"
+content-hash = "0b91f62051be0d320461cce57d11de08f7f79d9207f148971c72de21347292d3"
 
 [metadata.files]
 absl-py = [
