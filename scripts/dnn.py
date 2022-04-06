@@ -1,19 +1,15 @@
+import argparse
 import os
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 ######################################################
 
-from typing import Any, Callable, Sequence, Optional
+from functools import partial
+from typing import Any, Callable, Sequence, Optional, Tuple
 
-from tqdm import tqdm
-import numpy as np
 import jax.numpy as jnp
-from jax import random, nn, jit, vmap, tree_map
-
+from jax import random, nn, device_put, devices
 from flax import linen as fnn
-from flax.core.frozen_dict import FrozenDict
-
-from collections import defaultdict
 
 import optax
 import numpyro
@@ -24,34 +20,117 @@ from numpyro.contrib.module import flax_module
 
 from numpc.datasets import MNIST
 
-numpyro.set_platform('gpu')
-
 class DenseNet(fnn.Module):
   """A simple dense neural network."""
 
   features: Sequence[int]
+  act: Callable
 
   @fnn.compact
   def __call__(self, x):
     x = fnn.Dense(features=self.features[0])(x)
-    x = fnn.relu(x)
-    x = fnn.Dense(features=self.features[1])(x)
-    x = fnn.relu(x)
-    x = fnn.Dense(features=self.features[2])(x)
-
+    for f in self.features[1:]:
+        x = self.act(x)
+        x = fnn.Dense(features=f)(x)
+    
     return x
 
+class LeNet(fnn.Module):
+    """A simple convolutional network.
+    example from https://github.com/FluxML/model-zoo/tree/master/vision/conv_mnist
+    """
+       
+    conv_features: Sequence[int]
+    dense_features: Sequence[int]
+    kernel_size: Tuple[int] = (5, 5) 
+    window_shape: Tuple[int] = (2, 2) 
+    strides: Tuple[int] = (2, 2) 
 
-def model(images, sigma=1., labels=None, subsample_size=None, likelihood='normal'):
-    n, d = images.shape
-
-    nnet = flax_module("nnet", DenseNet([300, 100, 10]), input_shape=(1, d))
-
-    with numpyro.plate("N", n, subsample_size=subsample_size):
-        batch_x = numpyro.subsample(images, event_dim=1)
-        pred = nnet(batch_x) #nnet.apply({'params': FrozenDict(params)}, batch_x)
+    @fnn.compact
+    def __call__(self, x):
+        for f in self.conv_features:
+            x = fnn.Conv(features=f, kernel_size=self.kernel_size)(x)
+            x = fnn.relu(x)
+            x = fnn.avg_pool(x, window_shape=self.window_shape, strides=self.strides)
         
-        if likelihood == 'normal':
+        x = x.reshape((x.shape[0], -1))
+        x = fnn.Dense(features=self.dense_features[0])(x)
+        for f in self.dense_features[1:]:
+            x = fnn.relu(x)
+            x = fnn.Dense(features=f)(x)
+        return x
+
+ModuleDef = Any
+# flax_module does not work with batch_norm layers for now
+class ResNetBlock(fnn.Module):
+  """ResNet block."""
+  filters: int
+  conv: ModuleDef
+  norm: ModuleDef
+  act: Callable
+  kernel_size: Tuple[int, int] = (4, 4)
+  strides: Tuple[int, int] = (1, 1)
+
+  @fnn.compact
+  def __call__(self, x,):
+    residual = x
+    y = self.conv(self.filters, self.kernel_size, self.strides)(x)
+    # y = self.norm()(y)
+    y = self.act(y)
+    y = self.conv(self.filters, self.kernel_size)(y)
+    # y = self.norm(scale_init=fnn.initializers.zeros)(y)
+
+    if residual.shape != y.shape:
+      residual = self.conv(self.filters, (1, 1),
+                           self.strides, name='conv_proj')(residual)
+    #   residual = self.norm(name='norm_proj')(residual)
+
+    return self.act(residual + y)
+
+class ResNet(fnn.Module):
+  """ResNetV1."""
+  stage_sizes: Sequence[int]
+  block_cls: ModuleDef
+  num_classes: int
+  num_filters: int = 64
+  dtype: Any = jnp.float32
+  act: Callable = fnn.relu
+  conv: ModuleDef = fnn.Conv
+
+  @fnn.compact
+  def __call__(self, x, train: bool = True):
+    conv = partial(self.conv, use_bias=False, dtype=self.dtype)
+    norm = partial(fnn.BatchNorm,
+                   use_running_average=not train,
+                   momentum=0.9,
+                   epsilon=1e-5,
+                   dtype=self.dtype)
+
+    x = conv(self.num_filters, (7, 7), (2, 2),
+             padding=[(3, 3), (3, 3)],
+             name='conv_init')(x)
+    # x = norm(name='bn_init')(x)
+    x = self.act(x)
+    x = fnn.max_pool(x, (3, 3), strides=(2, 2), padding='SAME')
+    for i, block_size in enumerate(self.stage_sizes):
+      for j in range(block_size):
+        strides = (2, 2) if i > 0 and j == 0 else (1, 1)
+        x = self.block_cls(self.num_filters * 2 ** i,
+                           strides=strides,
+                           conv=conv,
+                           norm=norm,
+                           act=self.act)(x)
+    x = jnp.mean(x, axis=(1, 2))
+    x = fnn.Dense(self.num_classes, dtype=self.dtype)(x)
+    x = jnp.asarray(x, self.dtype)
+    return x
+
+def likelihood(nnet, images, labels, sigma, n, subsample_size, ll_type, event_dim=1):
+    with numpyro.plate("N", n, subsample_size=subsample_size):
+        batch_x = numpyro.subsample(images, event_dim=event_dim)
+        pred = nnet(batch_x)
+        
+        if ll_type == 'normal':
             if labels is not None:
                 batch_y = numpyro.subsample(labels, event_dim=1)
             else:
@@ -59,7 +138,7 @@ def model(images, sigma=1., labels=None, subsample_size=None, likelihood='normal
             numpyro.sample(
                 "obs", dist.Normal(pred, sigma).to_event(1), obs=batch_y
             )
-        elif likelihood == 'categorical':
+        elif ll_type == 'categorical':
             if labels is not None:
                 batch_y = numpyro.subsample(labels, event_dim=0)
             else:
@@ -68,55 +147,100 @@ def model(images, sigma=1., labels=None, subsample_size=None, likelihood='normal
                 "obs", dist.Categorical(logits=pred), obs=batch_y
             )
 
-rng_key = random.PRNGKey(0)
+def densenet(images, sigma=1., labels=None, subsample_size=None, likelihood_type='normal'):
+    n, d = images.shape
 
-# load data
-train_ds, test_ds = MNIST()
+    nnet = flax_module("nnet", DenseNet([300, 100, 10], fnn.swish), input_shape=(1, d))
 
-# reshape images for dense networks
-train_ds['image'] = train_ds['image'].reshape(train_ds['image'].shape[0], -1)
-test_ds['image'] = test_ds['image'].reshape(test_ds['image'].shape[0], -1)
+    likelihood(nnet, images, labels, sigma, n, subsample_size, likelihood_type)
 
-guide = AutoDelta(model)
-opt = optax.chain(
-    optax.clip(50.),
-    optax.adam(1e-4)
-)
-optimizer = numpyro.optim.optax_to_numpyro(opt)
 
-svi = SVI(model, guide, optimizer, loss=Trace_ELBO(num_particles=1))
-#########################################
-rng_key, _rng_key = random.split(rng_key)
-svi_result = svi.run(
-    _rng_key, 
-    30000, 
-    train_ds['image'], 
-    labels=nn.one_hot(train_ds['label'], 10), 
-    subsample_size=64)
+def lenet(images, sigma=1., labels=None, subsample_size=None, likelihood_type='normal'):
+    n, d, _, _ = images.shape
 
-params, losses = svi_result.params, svi_result.losses
+    nnet = flax_module("nnet", LeNet(conv_features=[8, 16], dense_features=[120, 84, 10]), input_shape=(1, d, d, 1))
 
-pred = Predictive(model, params=params, num_samples=1)
-sample = pred(_rng_key, test_ds['image'], sigma=1e-6)
+    likelihood(nnet, images, labels, sigma, n, subsample_size, likelihood_type, event_dim=3)
 
-acc = np.mean( sample['obs'][0].argmax(-1) == test_ds['label'] )
-print('model acc :', acc)
 
-#########################################
-guide = AutoDelta(model)
-rng_key, _rng_key = random.split(rng_key)
-svi_result = svi.run(
-    _rng_key, 
-    30000, 
-    train_ds['image'], 
-    labels=train_ds['label'], 
-    subsample_size=64,
-    likelihood='categorical')
+ResNet18 = partial(ResNet, stage_sizes=[2, 2, 2, 2], block_cls=ResNetBlock, num_filters=8)
 
-params, losses = svi_result.params, svi_result.losses
+def resnet(images, sigma=1., labels=None, subsample_size=None, likelihood_type='normal'):
+    n, d, _, _ = images.shape
 
-pred = Predictive(model, params=params, num_samples=1)
-sample = pred(_rng_key, test_ds['image'], likelihood='categorical')
+    nnet = flax_module("nnet", ResNet18(num_classes=10), input_shape=(1, d, d, 1))
 
-acc = np.mean( sample['obs'][0] == test_ds['label'] )
-print('model acc :', acc)
+    likelihood(nnet, images, labels, sigma, n, subsample_size, likelihood_type, event_dim=3)
+
+def fitting_and_testing(model, train_ds, test_ds, rng_key, likelihood_type):
+    guide = AutoDelta(model)
+    opt = optax.chain(
+        optax.clip(100.),
+        optax.adam(1e-4)
+    )
+    optimizer = numpyro.optim.optax_to_numpyro(opt)
+
+    svi = SVI(model, guide, optimizer, loss=Trace_ELBO(num_particles=1))
+    #########################################
+    print(f'Fit with {likelihood_type} likelihood:')
+    rng_key, _rng_key = random.split(rng_key)
+
+    if likelihood_type == 'normal':
+        svi_result = svi.run(
+            _rng_key, 
+            10000, 
+            train_ds['image'], 
+            labels=nn.one_hot(train_ds['label'], 10), 
+            subsample_size=256,
+            likelihood_type=likelihood_type)
+    elif likelihood_type == 'categorical':
+        svi_result = svi.run(
+            _rng_key, 
+            10000, 
+            train_ds['image'], 
+            labels=train_ds['label'], 
+            subsample_size=256,
+            likelihood_type=likelihood_type)
+
+
+    params, losses = svi_result.params, svi_result.losses
+
+    # for some reason testing takes additional memory so the results have to be casted
+    # back to cpu before testing to reduce memory usage on gpu
+    params = device_put(params, devices('cpu')[0])  
+
+    pred = Predictive(model, params=params, num_samples=1)
+    rng_key, _rng_key = random.split(rng_key)
+    sample = pred(_rng_key, test_ds['image'], sigma=1e-6)
+    acc = jnp.mean( sample['obs'][0].argmax(-1) == test_ds['label'] )
+    
+    print('model acc :', acc)
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Deep neural networks training")
+    parser.add_argument("-n", "--network", nargs='?', default='DenseNet', type=str)
+    parser.add_argument("--device", nargs='?', default='gpu', type=str)
+    parser.add_argument("--seed", nargs='?', default=0, type=int)
+    parser.add_argument("-ll", "--likelihood", nargs='?', default='normal', type=str)
+
+    args = parser.parse_args()
+    numpyro.set_platform(args.device)
+
+    # load data
+    train_ds, test_ds = MNIST()
+    
+    print('Fitting {} ...\n'.format(args.network))
+
+    if args.network == 'DenseNet':
+        # reshape images for dense networks
+        train_ds['image'] = train_ds['image'].reshape(train_ds['image'].shape[0], -1)
+        test_ds['image'] = test_ds['image'].reshape(test_ds['image'].shape[0], -1)
+        model = densenet
+    elif args.network == 'LeNet':
+        model = lenet
+    
+    elif args.network == 'ResNet':
+        model = resnet
+
+    rng_key = random.PRNGKey(args.seed)
+    fitting_and_testing(model, train_ds, test_ds, rng_key, likelihood_type=args.likelihood)
