@@ -5,28 +5,24 @@ os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 
 import tqdm
 import numpy as np
-import jax.numpy as jnp
-import optax
-import jax
-
-from jax import random, nn, jit, vmap
-
-from flax import linen as fnn
-from flax.core.frozen_dict import FrozenDict
-
-from collections import defaultdict
 
 import numpyro
 import numpyro.distributions as dist
 from numpyro.infer import SVI, Trace_ELBO, TraceMeanField_ELBO, Predictive
 from numpyro.infer.autoguide import AutoDelta, AutoNormal
 from numpyro.infer.initialization import init_to_value
-from numpyro.contrib.module import flax_module
-
+from numpyro.contrib.module import flax_module, random_flax_module
+from numpyro.infer.reparam import TransformReparam, LocScaleReparam
 from numpc.datasets import MNIST
 
-numpyro.set_platform('gpu')
+numpyro.set_platform('cpu')
 # numpyro.enable_validation(True)
+
+import jax.numpy as jnp
+import optax
+from jax import random, nn, jit, vmap
+from flax import linen as fnn
+
 
 class DenseLayer(fnn.Module):
   """A simple dense layer of a neural network."""
@@ -34,9 +30,23 @@ class DenseLayer(fnn.Module):
 
   @fnn.compact
   def __call__(self, x):
-    x = fnn.Dense(features=self.features)(x)
+    x = fnn.Dense(features=self.features, name='dense')(x)
     x = fnn.relu(x)
     return x
+
+def random_network_layers(features, image_dim):
+    "Network layer with parameters being random variables"
+    nnets = []
+    d = image_dim
+    L = len(features)
+    for i, f in enumerate(features):
+        tau = numpyro.sample('layer{}.tau'.format(L - i - 1), dist.HalfCauchy(1.).expand([f]).to_event(1))
+        lam = numpyro.sample('layer{}.lam'.format(L - i - 1), dist.HalfCauchy(1.).expand([d, f]).to_event(2))
+        prior = {"dense.bias": dist.Cauchy(), "dense.kernel": dist.Normal(0, 0.1 * lam * tau)}
+        nnet = random_flax_module('layer{}'.format(L - i - 1), DenseLayer(f), prior, input_shape=(1, d))
+        d = f
+        nnets.append(nnet)    
+    return nnets
 
 def network_layers(features, image_dim):
     nnets = []
@@ -52,13 +62,16 @@ def model(features, images, labels=None, subsample_size=None, likelihood='normal
     n, d = images.shape
 
     nnets = network_layers(features, d)
+    # nnets = random_network_layers(features, d)
+
     L = len(nnets)
     
     inp_par = jnp.zeros(d)
 
     scales = []
     for i, f in enumerate(features):
-        scales.append(numpyro.param('layer{}.scale'.format(L-i), jnp.ones(f), constraint=dist.constraints.positive))
+        s_sqr = numpyro.sample('l{}.scale'.format(L-i), dist.InverseGamma(2, 2).expand([f]).to_event(1))
+        scales.append(jnp.sqrt(s_sqr))
 
     with numpyro.plate('batch', n, subsample_size=subsample_size):
         if images is not None:
@@ -90,8 +103,15 @@ def model(features, images, labels=None, subsample_size=None, likelihood='normal
                 x_out = numpyro.sample('x_{}'.format(L-l), dist.Normal(pred, sigma*scales[l-1]).to_event(1))
 
 
-def test_model(test_data, features, params, likelihood='normal'):
-    pred = Predictive(model, params=params, num_samples=1)
+def test_model(rng_key, guide, test_data, features, params, likelihood='normal'):
+    rng_key, _rng_key = random.split(rng_key)
+    pred = Predictive(guide, params=params, num_samples=1)
+    sample = pred(_rng_key)
+    for i in range(1, len(features)):
+        sample.pop(f'x_{i}')
+    
+    rng_key, _rng_key = random.split(rng_key)
+    pred = Predictive(model, posterior_samples=sample, params=params)
     sample = pred(_rng_key, features, test_data['image'], sigma=1e-6, likelihood=likelihood)
 
     pred_label = sample['x_0'][0]
@@ -140,12 +160,12 @@ train_ds['image'] = train_ds['image'].reshape(train_ds['image'].shape[0], -1)
 test_ds['image'] = test_ds['image'].reshape(test_ds['image'].shape[0], -1)
 
 
-batch_size = 10000
+batch_size = 12000
 features = [300, 100, 10]
 
 ll = 'normal'
-guide = AutoDelta(model)
-svi = SVI(model, guide, optimizer, loss=Trace_ELBO(num_particles=1))
+guide = AutoNormal(model)
+svi = SVI(model, guide, optimizer, loss=TraceMeanField_ELBO(num_particles=1))
 rng_key, _rng_key = random.split(random.PRNGKey(0))
 init_state = svi.init(
         _rng_key, 
@@ -156,11 +176,11 @@ init_state = svi.init(
         likelihood=ll
     )
 #Note: model parameters can be accessed with init_state.optim_state[1][0] == params
-# to initiatate 'x_1', and 'x_2' at specific values that could be done here 
-# by modifying 'x_1_auto_loc' and 'x_2_auto_loc' dictionary entries.
+# to initiatate 'x_1', and 'x_2' at specific values one could modifying 
+# 'x_1_auto_loc' and 'x_2_auto_loc' entries of the params dict.
  
-epochs = 2
-num_iters = 20000
+epochs = 5
+num_iters = 10000
 losses = []
 with tqdm.trange(epochs) as t:
     for _ in t:
@@ -178,9 +198,34 @@ with tqdm.trange(epochs) as t:
         )
         init_state = svi_result.state
 
-        acc = test_model(test_ds, features, svi_result.params, likelihood=ll)
+        rng_key, _rng_key = random.split(rng_key)
+        acc = test_model(_rng_key, guide, test_ds, features, svi_result.params, likelihood=ll)
         losses.append( svi_result.losses )
         t.set_postfix_str(
             "elbo: {:.4f} - test acc: {:.4f}".format(jnp.mean(losses[-1][-1000:]), acc),
             refresh=False,
         )
+
+print(svi_result.params.keys())
+
+sample = guide.sample_posterior(rng_key, svi_result.params)
+print(sample.keys())
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+plt.figure()
+plt.plot(losses[-1])
+
+fig, axes = plt.subplots(1, 2, figsize=(16, 5))
+sns.heatmap(sample['layer0.lam'], ax=axes[0], cmap='magma')
+sns.heatmap(sample['layer1.lam'], ax=axes[1], cmap='magma')
+
+fig, axes = plt.subplots(1, 2, figsize=(16, 5))
+sns.heatmap(sample['layer0.tau'][:, None], ax=axes[0], cmap='magma')
+sns.heatmap(sample['layer1.tau'][:, None], ax=axes[1], cmap='magma')
+
+fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+sns.heatmap(svi_result.params['layer0/dense.kernel_auto_loc'], ax=axes[0], cmap='magma')
+sns.heatmap(svi_result.params['layer1/dense.kernel_auto_loc'], ax=axes[1], cmap='magma')
+sns.heatmap(svi_result.params['layer2/dense.kernel_auto_loc'], ax=axes[2], cmap='magma')

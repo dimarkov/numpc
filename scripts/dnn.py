@@ -1,5 +1,7 @@
 import argparse
 import os
+
+from attr import mutable
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 ######################################################
@@ -27,7 +29,7 @@ class DenseNet(fnn.Module):
   act: Callable
 
   @fnn.compact
-  def __call__(self, x):
+  def __call__(self, x, **kwargs):
     x = fnn.Dense(features=self.features[0])(x)
     for f in self.features[1:]:
         x = self.act(x)
@@ -47,7 +49,7 @@ class LeNet(fnn.Module):
     strides: Tuple[int] = (2, 2) 
 
     @fnn.compact
-    def __call__(self, x):
+    def __call__(self, x, **kwargs):
         for f in self.conv_features:
             x = fnn.Conv(features=f, kernel_size=self.kernel_size)(x)
             x = fnn.relu(x)
@@ -75,15 +77,15 @@ class ResNetBlock(fnn.Module):
   def __call__(self, x,):
     residual = x
     y = self.conv(self.filters, self.kernel_size, self.strides)(x)
-    # y = self.norm()(y)
+    y = self.norm()(y)
     y = self.act(y)
     y = self.conv(self.filters, self.kernel_size)(y)
-    # y = self.norm(scale_init=fnn.initializers.zeros)(y)
+    y = self.norm(scale_init=fnn.initializers.zeros)(y)
 
     if residual.shape != y.shape:
       residual = self.conv(self.filters, (1, 1),
                            self.strides, name='conv_proj')(residual)
-    #   residual = self.norm(name='norm_proj')(residual)
+      residual = self.norm(name='norm_proj')(residual)
 
     return self.act(residual + y)
 
@@ -92,13 +94,13 @@ class ResNet(fnn.Module):
   stage_sizes: Sequence[int]
   block_cls: ModuleDef
   num_classes: int
-  num_filters: int = 64
+  num_filters: int = 16
   dtype: Any = jnp.float32
   act: Callable = fnn.relu
   conv: ModuleDef = fnn.Conv
 
   @fnn.compact
-  def __call__(self, x, train: bool = True):
+  def __call__(self, x, train):
     conv = partial(self.conv, use_bias=False, dtype=self.dtype)
     norm = partial(fnn.BatchNorm,
                    use_running_average=not train,
@@ -109,7 +111,7 @@ class ResNet(fnn.Module):
     x = conv(self.num_filters, (7, 7), (2, 2),
              padding=[(3, 3), (3, 3)],
              name='conv_init')(x)
-    # x = norm(name='bn_init')(x)
+    x = norm(name='bn_init')(x)
     x = self.act(x)
     x = fnn.max_pool(x, (3, 3), strides=(2, 2), padding='SAME')
     for i, block_size in enumerate(self.stage_sizes):
@@ -125,10 +127,10 @@ class ResNet(fnn.Module):
     x = jnp.asarray(x, self.dtype)
     return x
 
-def likelihood(nnet, images, labels, sigma, n, subsample_size, ll_type, event_dim=1):
+def likelihood(nnet, images, labels, sigma, n, subsample_size, ll_type, event_dim=1, train=False):
     with numpyro.plate("N", n, subsample_size=subsample_size):
         batch_x = numpyro.subsample(images, event_dim=event_dim)
-        pred = nnet(batch_x)
+        pred = nnet(batch_x, train=train)
         
         if ll_type == 'normal':
             if labels is not None:
@@ -147,7 +149,7 @@ def likelihood(nnet, images, labels, sigma, n, subsample_size, ll_type, event_di
                 "obs", dist.Categorical(logits=pred), obs=batch_y
             )
 
-def densenet(images, sigma=1., labels=None, subsample_size=None, likelihood_type='normal'):
+def densenet(images, sigma=1., labels=None, subsample_size=None, likelihood_type='normal', train=False):
     n, d = images.shape
 
     nnet = flax_module("nnet", DenseNet([300, 100, 10], fnn.swish), input_shape=(1, d))
@@ -155,7 +157,7 @@ def densenet(images, sigma=1., labels=None, subsample_size=None, likelihood_type
     likelihood(nnet, images, labels, sigma, n, subsample_size, likelihood_type)
 
 
-def lenet(images, sigma=1., labels=None, subsample_size=None, likelihood_type='normal'):
+def lenet(images, sigma=1., labels=None, subsample_size=None, likelihood_type='normal', train=False):
     n, d, _, _ = images.shape
 
     nnet = flax_module("nnet", LeNet(conv_features=[8, 16], dense_features=[120, 84, 10]), input_shape=(1, d, d, 1))
@@ -163,17 +165,20 @@ def lenet(images, sigma=1., labels=None, subsample_size=None, likelihood_type='n
     likelihood(nnet, images, labels, sigma, n, subsample_size, likelihood_type, event_dim=3)
 
 
-ResNet18 = partial(ResNet, stage_sizes=[2, 2, 2, 2], block_cls=ResNetBlock, num_filters=8)
+ResNet18 = partial(ResNet, stage_sizes=[2, 2, 2, 2], block_cls=ResNetBlock)
+ResNet34 = partial(ResNet, stage_sizes=[3, 4, 6, 3], block_cls=ResNetBlock)
+ResNet50 = partial(ResNet, stage_sizes=[3, 4, 6, 3], block_cls=ResNetBlock)
 
-def resnet(images, sigma=1., labels=None, subsample_size=None, likelihood_type='normal'):
+
+def resnet(images, sigma=1., labels=None, subsample_size=None, likelihood_type='normal', train=False):
     n, d, _, _ = images.shape
 
-    nnet = flax_module("nnet", ResNet18(num_classes=10), input_shape=(1, d, d, 1))
+    nnet = flax_module("nnet", ResNet50(num_classes=10), input_shape=(1, d, d, 1), mutable=["batch_stats"], train=True)
 
-    likelihood(nnet, images, labels, sigma, n, subsample_size, likelihood_type, event_dim=3)
+    likelihood(nnet, images, labels, sigma, n, subsample_size, likelihood_type, event_dim=3, train=train)
 
 def fitting_and_testing(model, train_ds, test_ds, rng_key, likelihood_type):
-    guide = AutoDelta(model)
+    guide = lambda *args, **kwargs: None  # MLE estimate
     opt = optax.chain(
         optax.clip(100.),
         optax.adam(1e-4)
@@ -182,7 +187,7 @@ def fitting_and_testing(model, train_ds, test_ds, rng_key, likelihood_type):
 
     svi = SVI(model, guide, optimizer, loss=Trace_ELBO(num_particles=1))
     #########################################
-    print(f'Fit with {likelihood_type} likelihood:')
+
     rng_key, _rng_key = random.split(rng_key)
 
     if likelihood_type == 'normal':
@@ -192,7 +197,8 @@ def fitting_and_testing(model, train_ds, test_ds, rng_key, likelihood_type):
             train_ds['image'], 
             labels=nn.one_hot(train_ds['label'], 10), 
             subsample_size=256,
-            likelihood_type=likelihood_type)
+            likelihood_type=likelihood_type,
+            train=True)
     elif likelihood_type == 'categorical':
         svi_result = svi.run(
             _rng_key, 
@@ -200,16 +206,19 @@ def fitting_and_testing(model, train_ds, test_ds, rng_key, likelihood_type):
             train_ds['image'], 
             labels=train_ds['label'], 
             subsample_size=256,
-            likelihood_type=likelihood_type)
+            likelihood_type=likelihood_type,
+            train=True)
 
 
-    params, losses = svi_result.params, svi_result.losses
+    params, mutable_states = svi_result.params, svi_result.state.mutable_state
+    if mutable_states is None:
+        mutable_states = {}
 
     # for some reason testing takes additional memory so the results have to be casted
     # back to cpu before testing to reduce memory usage on gpu
     params = device_put(params, devices('cpu')[0])  
 
-    pred = Predictive(model, params=params, num_samples=1)
+    pred = Predictive(model, params={**params, **mutable_states}, num_samples=1)
     rng_key, _rng_key = random.split(rng_key)
     sample = pred(_rng_key, test_ds['image'], sigma=1e-6)
     acc = jnp.mean( sample['obs'][0].argmax(-1) == test_ds['label'] )
@@ -229,7 +238,7 @@ if __name__ == '__main__':
     # load data
     train_ds, test_ds = MNIST()
     
-    print('Fitting {} ...\n'.format(args.network))
+    print('Fitting {} with {} likelihood.\n'.format(args.network, args.likelihood))
 
     if args.network == 'DenseNet':
         # reshape images for dense networks
