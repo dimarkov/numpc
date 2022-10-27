@@ -1,3 +1,4 @@
+from signal import Sigmasks
 import jax.numpy as jnp
 import numpyro.distributions as dist
 import optax
@@ -8,7 +9,7 @@ from jax import nn, lax, random, vmap, device_put
 from numpyro import handlers, sample, plate, deterministic, factor, subsample, param
 from numpyro.infer import NUTS, MCMC, SVI, Trace_ELBO, TraceMeanField_ELBO, Predictive
 from numpyro.distributions import constraints
-from numpyro.distributions.transforms import Transform, AffineTransform, ComposeTransform
+from numpyro.distributions.transforms import Transform, AffineTransform, ComposeTransform, ExpTransform
 from numpyro.infer.reparam import TransformReparam
 from numpyro.infer.autoguide import AutoDelta, AutoNormal, AutoMultivariateNormal, AutoLowRankMultivariateNormal
 from numpyro.optim import optax_to_numpyro
@@ -516,6 +517,23 @@ class BMRDNN(object):
         nnet = vmap(self._register_network_vars())
         self.likelihood(nnet, labels)
 
+    def mv_guide(self, labels=None):
+        for l, layer in enumerate(self.vals[0]):
+            lv, l_aux = layer.tree_flatten()
+            for value, name in zip(lv, l_aux[0]):
+                if value is not None:
+                    if name == 'bias':
+                        name = f'layer{l}.{name}'
+                        loc = param('loc.' + name, value)
+                        scale = param('scale.' + name, jnp.diag(jnp.ones(value.shape))/10, constraint=dist.constraints.lower_cholesky)
+                        sample(name, dist.MultivariateNormal(loc, scale_tril=scale))
+                    else:
+                        name = f'layer{l}.{name}'
+                        loc = param('mu.' + name, value)
+                        i, j = value.shape
+                        cov = param('cov.' + name, jnp.zeros((i, j, j)))
+                        sample(name, dist.MultivariateNormal(loc, cov))
+
     def lowrank_guide(self, labels=None):
         for l, layer in enumerate(self.vals[0]):
             lv, l_aux = layer.tree_flatten()
@@ -539,16 +557,39 @@ class BMRDNN(object):
         u0 = jnp.expand_dims(u[..., 0], -1)
         return self.tau_0**2 * v[..., 1:] * v0 / (c_sqr * u[..., 1:] * u0 + self.tau_0**2 * v[..., 1:] * v0)
 
-    def ΔF(self, mu, Sigma, gamma):
+    def ΔF(self, mu, d, W, gamma):
+        # Σ = D + W @ W.T
+        Σ = jnp.diag(d) + W @ W.T
+        # C = I + W.T @ inv(D) @ W
+        C = jnp.eye(self.rank) + W.T @ (W/jnp.expand_dims(d, -1))
+        # D' = G + D @ (I - G)
+        _d = gamma + d * (1 - gamma)  
+        # W' = (I - G) @ W
+        _W = jnp.expand_dims(1 - gamma, -1) * W
+        # M = D' + W @ W'.T
+        M = jnp.diag(_d) + W @ _W.T
+        # C' = I + W'.T @ inv(D') @ W
+        _C = jnp.eye(self.rank) + _W.T @ ( W/jnp.expand_dims(_d, -1) )         
         
-        M = jnp.diag(gamma) + Sigma * jnp.expand_dims(1 - gamma, -2)
+        # log|M| = log|D'| + log|C'|
+        df = - jnp.log(_d).sum()/2
 
-        _, logdet = jnp.linalg.slogdet(M)
-        df = - logdet/2
-        
-        df += jnp.dot(mu, jnp.linalg.solve(Sigma, gamma * jnp.linalg.solve(M, mu)))/2
+        _, logdet = jnp.linalg.slogdet(_C)
+        df -= logdet/2
 
-        return df
+        # inv(M) = inv(D') - inv(D') @ W @ inv(C') @ W'.T @ inv(D') = inv(D') - R
+        # Σ' = G @ inv(M) @ Σ = G @ inv(D') @ D - G @ R @ D + G @ inv(D') @ W @ W.T - G @ R @ W @ W.T
+        _Σ = jnp.expand_dims(gamma, -1) * jnp.linalg.solve(M, Σ)
+
+        # mu' = G @ inv(M) @ mu
+        _μ = gamma * jnp.linalg.solve(M, mu)
+
+        # inv(Σ) = inv(D) - inv(D) @ W @ inv(C) @ W.T @ inv(D)
+        tmp = _μ/d
+        tmp = tmp - (W @ jnp.linalg.solve(C, W.T @ tmp))/d
+        df += jnp.dot(mu, tmp)/2
+
+        return df, _μ, _Σ
             
     def bmr_model(self, params):
         for l, layer in enumerate(self.vals[0]):
@@ -558,29 +599,37 @@ class BMRDNN(object):
                     if name == 'weight':
                         name = f'layer{l}.{name}'
                         shape = value.shape
-                        c_sqr = sample(f'{name}.c^2', dist.Gamma(2, 1))
+                        c_sqr = sample(f'{name}.c^2', dist.InverseGamma(2, 3))
                         with plate(name, shape[0]):
                             u = sample(f'{name}.u', dist.Gamma(1/2, 1).expand([shape[-1] + 1]).to_event(1))
                             v = sample(f'{name}.v', dist.Gamma(1/2, 1).expand([shape[-1] + 1]).to_event(1))
 
                             tau = deterministic(f'{name}.tau', self.tau_0 * jnp.sqrt(v[..., 0]/u[..., 0]))
                             lam = deterministic(f'{name}.lam', jnp.expand_dims(tau, -1) * jnp.sqrt(v[..., 1:]/u[..., 1:]))
-                            g = deterministic(f'{name}.gamma^2, self.gamma(c_sqr, v, u))
+                            g = deterministic(f'{name}.gamma^2', self.gamma(c_sqr, v, u))
                             
                             mu = params['loc.' + name]
                             cov_diag = params['cov_diag.' + name]
                             cov_factor = params['cov_factor.' + name]
 
-                            Sigma = vmap(jnp.diag)(cov_diag)
-                            Sigma += jnp.matmul(cov_factor, jnp.swapaxes(cov_factor, -1, -2))
-
-                            log_prob = vmap(self.ΔF)(mu, Sigma, g)
+                            log_prob, t_mu, t_Sigma = vmap(self.ΔF)(mu, cov_diag, cov_factor, g)
+                            deterministic(f'mu.{name}', t_mu)
+                            deterministic(f'cov.{name}', t_Sigma)
                             factor(f'{name}.log_prob', log_prob)
 
-    def _log_normal(self, name, shape):
+    def _log_normal(self, name, shape, scale=.1):
         loc = param(f'{name}.loc', jnp.zeros(tuple(shape)))
-        scale = param(f'{name}.scale', jnp.ones(tuple(shape))/10, constraint=dist.constraints.softplus_positive)
-        return sample(name, dist.LogNormal(loc, scale).expand(shape).to_event(1))
+        scale = param(f'{name}.scale', scale*jnp.ones(tuple(shape)), constraint=dist.constraints.softplus_positive)
+        return sample(name, dist.LogNormal(loc, scale).to_event(1))
+
+    def _log_lowrank_normal(self, name, shape, scale=.1):
+        loc = param(f'{name}.loc', jnp.zeros(tuple(shape)))
+        cov_diag = param(f'{name}.cov_diag', scale*jnp.ones(tuple(shape)), constraint=dist.constraints.softplus_positive)
+        cov_factor = param('cov_factor.' + name, jnp.zeros(tuple(shape) + (self.rank,)))
+
+        Exp = ExpTransform()
+        mvn = dist.LowRankMultivariateNormal(loc, cov_factor, cov_diag)
+        sample(name, dist.TransformedDistribution(mvn, Exp))
 
     def bmr_guide(self, params):
         for l, layer in enumerate(self.vals[0]):
@@ -594,8 +643,8 @@ class BMRDNN(object):
                         scale_c = param(f'{name}.c^2.scale', jnp.ones(1), constraint=dist.constraints.softplus_positive)
                         sample(f'{name}.c^2', dist.LogNormal(loc_c, scale_c))
                         with plate(name, shape[0]):
-                            self._log_normal(f'{name}.u', [shape[0], shape[-1] + 1])
-                            self._log_normal(f'{name}.v', [shape[0], shape[-1] + 1])
+                            self._log_lowrank_normal(f'{name}.u', [shape[0], shape[-1] + 1])
+                            self._log_lowrank_normal(f'{name}.v', [shape[0], shape[-1] + 1])
 
     def run_svi(self, rng_key, num_steps, model, guide, optimizer, loss, *args, **kwargs):
         svi = SVI(model, guide, optimizer, loss)
@@ -622,26 +671,25 @@ class BMRDNN(object):
         self.rng_key, _rng_key = random.split(self.rng_key)
         _rng_key = device_put(_rng_key, dev)
         params = device_put(params, dev)
-        bmr_res = self.run_svi(_rng_key, num_steps, _model, _guide, optimizer, TraceMeanField_ELBO(num_particles), params)
+        bmr_res = self.run_svi(_rng_key, num_steps, _model, _guide, optimizer, Trace_ELBO(num_particles), params)
 
-        return bmr_res
+        L = self.nnet.depth + 1
+        return_sites = [f'mu.layer{l}.weight' for l in range(L)] 
+        return_sites += [f'cov.layer{l}.weight' for l in range(L)]
+        pred = Predictive(_model, guide=_guide, params=bmr_res.params, num_samples=num_samples, return_sites=return_sites)
+        self.rng_key, _rng_key = random.split(self.rng_key)
+        samples = pred(_rng_key, params)
 
-        # self.results = svi.run(_rng_key, num_steps, a_n, b_n, mu_n, P_n, obs=data)
+        return bmr_res, samples
 
-        # return_sites = ["tau", "lam", "gamma^2"]
-        # pred = Predictive(model, guide=guide, params=self.results.params, num_samples=num_samples, return_sites=return_sites)
-        # self.samples = pred(_rng_key, a_n, b_n, mu_n, P_n, obs=data)
+    def test_model(self, model, guide, params, images, labels, num_samples=1):
+        pred = Predictive(model, guide=guide, params=params, num_samples=num_samples)
+        n, _ = images.shape
+        self.rng_key, _rng_key = random.split(self.rng_key)
+        sample = pred(_rng_key, self.nnet, images, subsample_size=n)
 
-        # blr = partial(exact_blr, self.X, data)
-        # mu_n, P_n, a_n, b_n = vmap(blr)(lam=1/self.samples['gamma^2'])
-
-        # self.rng_key, _rng_key = random.split(self.rng_key)
-        # sigma_square = dist.InverseGamma(a_n, b_n).sample(_rng_key)
-        # self.samples['sigma^2'] = sigma_square
-
-        # self.rng_key, _rng_key = random.split(self.rng_key)
-        # precision_matrix = jnp.expand_dims(1/sigma_square, (-1, -2)) * P_n
-        # beta = dist.MultivariateNormal(mu_n, precision_matrix=precision_matrix).sample(_rng_key)
-        # self.samples['beta'] = beta
-
-        return bmr_res, params
+        if num_samples > 1:
+            acc = jnp.mean(sample['obs'] == labels, -1)
+            print(acc.mean(), acc.std())
+        else:
+            print( jnp.mean(sample['obs'] == labels) )
