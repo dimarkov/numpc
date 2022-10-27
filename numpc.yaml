@@ -1,0 +1,18 @@
+name: base
+channels:
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - jax
+  - tensorflow
+  - seaborn
+  - matplotlib
+  - seaborn
+  - jupyter
+  - pip:
+    - diffrax
+    - equinox
+    - optax
+    - tensorflow-datasets
+    - flax

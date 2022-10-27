@@ -16,11 +16,10 @@ from flax import linen as fnn
 import optax
 import numpyro
 import numpyro.distributions as dist
-from numpyro.infer import SVI, Trace_ELBO, TraceMeanField_ELBO, Predictive
-from numpyro.infer.autoguide import AutoDelta, AutoNormal
+from numpyro.infer import SVI, Trace_ELBO, Predictive
 from numpyro.contrib.module import flax_module
 
-from numpc.datasets import MNIST
+from numpc.datasets import load_data
 
 class DenseNet(fnn.Module):
   """A simple dense neural network."""
@@ -180,29 +179,31 @@ def resnet(images, sigma=1., labels=None, subsample_size=None, likelihood_type='
 def fitting_and_testing(model, train_ds, test_ds, rng_key, likelihood_type):
     guide = lambda *args, **kwargs: None  # MLE estimate
     opt = optax.chain(
-        optax.clip(100.),
-        optax.adam(1e-4)
+        optax.adabelief(1e-4)
     )
     optimizer = numpyro.optim.optax_to_numpyro(opt)
 
     svi = SVI(model, guide, optimizer, loss=Trace_ELBO(num_particles=1))
     #########################################
 
+    n_labels = len(jnp.unique(train_ds['label']))
+    
     rng_key, _rng_key = random.split(rng_key)
 
     if likelihood_type == 'normal':
         svi_result = svi.run(
             _rng_key, 
-            10000, 
+            50000, 
             train_ds['image'], 
-            labels=nn.one_hot(train_ds['label'], 10), 
+            labels=nn.one_hot(train_ds['label'], n_labels), 
             subsample_size=256,
             likelihood_type=likelihood_type,
             train=True)
+
     elif likelihood_type == 'categorical':
         svi_result = svi.run(
             _rng_key, 
-            10000, 
+            50000, 
             train_ds['image'], 
             labels=train_ds['label'], 
             subsample_size=256,
@@ -221,7 +222,7 @@ def fitting_and_testing(model, train_ds, test_ds, rng_key, likelihood_type):
     pred = Predictive(model, params={**params, **mutable_states}, num_samples=1)
     rng_key, _rng_key = random.split(rng_key)
     sample = pred(_rng_key, test_ds['image'], sigma=1e-6)
-    acc = jnp.mean( sample['obs'][0].argmax(-1) == test_ds['label'] )
+    acc = jnp.mean( sample['obs'].argmax(-1) == test_ds['label'] )
     
     print('model acc :', acc)
 
@@ -231,12 +232,13 @@ if __name__ == '__main__':
     parser.add_argument("--device", nargs='?', default='gpu', type=str)
     parser.add_argument("--seed", nargs='?', default=0, type=int)
     parser.add_argument("-ll", "--likelihood", nargs='?', default='normal', type=str)
+    parser.add_argument("-ds", "--data-set", nargs='?', default='mnist', type=str)
 
     args = parser.parse_args()
     numpyro.set_platform(args.device)
 
     # load data
-    train_ds, test_ds = MNIST()
+    train_ds, test_ds = load_data(args.data_set)
     
     print('Fitting {} with {} likelihood.\n'.format(args.network, args.likelihood))
 
