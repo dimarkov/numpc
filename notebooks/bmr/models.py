@@ -461,8 +461,6 @@ class BayesDNN(object):
         samples = None
         return params
 
-def substract(a, b):
-    return a - b
 
 def linearize_nnet(nnet, Ws, x):
     params, static = eqx.partition(nnet, eqx.is_inexact_array)
@@ -470,7 +468,7 @@ def linearize_nnet(nnet, Ws, x):
         nn = eqx.combine(p, static)
         return vmap(nn)(x)
 
-    in_tangents = jtu.tree_map(substract, Ws, params)
+    in_tangents = Ws
     
     out, f_jvp = linearize(f, params)
 
@@ -573,7 +571,7 @@ class BMRDNN(object):
                         i, j = value.shape
                         scale_u = param('scale_u.' + name, jnp.ones((i, rank))/jnp.sqrt(10 * rank))
                         scale_v = param('scale_v.' + name, jnp.ones((rank, j))/jnp.sqrt(10 * rank))
-                        scale = deterministic('scale.' + name, jnp.abs(scale_u @ scale_v))
+                        scale = jnp.abs(scale_u @ scale_v)
                         sample(name, dist.Normal(0., scale).to_event(1))
         
     def aux_guide(self, labels=None):
@@ -584,12 +582,11 @@ class BMRDNN(object):
                 if value is not None:
                     if name == 'bias':
                         name = f'layer{l}.{name}'
-                        scale = param('scale.' + name, jnp.ones(value.shape)/10, constraint=dist.constraints.softplus_positive)
+                        scale = param('scale.' + name, jnp.ones(value.shape), constraint=dist.constraints.softplus_positive)
                         sample(name, dist.Normal(0., scale).to_event(1))
                     else:
                         name = f'layer{l}.{name}'
-                        i, j = value.shape
-                        scale = param('scale.' + name, jnp.ones((i, rank))/jnp.sqrt(10 * rank))
+                        scale = param('scale.' + name, jnp.ones(value.shape))
                         sample(name, dist.Normal(0., scale).to_event(1))
 
     def gamma(self, c_sqr, v, u):
@@ -597,13 +594,14 @@ class BMRDNN(object):
         u0 = jnp.expand_dims(u[..., 0], -1)
         return self.tau_0**2 * c_sqr * v[..., 1:] * v0/(c_sqr * u[..., 1:] * u0  + self.tau_0 * v[..., 1:] * v0)
 
-    def ΔF(self, μ, σ_sqr, γ_sqr, π_0=1.):
+    def ΔF(self, μ, σ_sqr, γ_sqr):
+        π_0 = 1/self.sigma_0**2
         # π_{lij} = 1/σ^2
         π = 1/σ_sqr
 
         # m_{lij} = γ² + σ² - π₀σ²γ²
 
-        m = γ_sqr + σ_sqr - π_0 * σ_sqr * γ_sqr
+        m = jnp.clip(γ_sqr + σ_sqr - π_0 * σ_sqr * γ_sqr, a_min=1e-16)
 
         # \tilde{σ}^2_{lij} = γ² σ² / m
         _σ_sqr = γ_sqr * σ_sqr / m
@@ -638,7 +636,7 @@ class BMRDNN(object):
                             v = params['scale_v.' + name]
                             σ_sqr = jnp.square(u @ v)
 
-                            log_prob, t_mu, t_scale = vmap(self.ΔF)(μ, σ_sqr, γ_sqr, π_0 = 1/self.sigma_0**2)
+                            log_prob, t_mu, t_scale = vmap(self.ΔF)(μ, σ_sqr, γ_sqr)
                             deterministic(f'loc.{name}', t_mu)
                             deterministic(f'scale.{name}', t_scale)
                             factor(f'{name}.log_prob', log_prob)
@@ -691,7 +689,8 @@ class BMRDNN(object):
         bmr_res = self.run_svi(_rng_key, num_steps, _model, _guide, optimizer, Trace_ELBO(num_particles), params)
 
         L = self.nnet.depth + 1
-        return_sites = [f'loc.layer{l}.weight' for l in range(L)] 
+        return_sites = [f'layer{l}.weight.gamma^2' for l in range(L)] 
+        return_sites += [f'loc.layer{l}.weight' for l in range(L)] 
         return_sites += [f'scale.layer{l}.weight' for l in range(L)]
         pred = Predictive(_model, guide=_guide, params=bmr_res.params, num_samples=num_samples, return_sites=return_sites)
         self.rng_key, _rng_key = random.split(self.rng_key)
