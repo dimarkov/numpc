@@ -11,8 +11,8 @@ from numpyro.infer import NUTS, MCMC, SVI, Trace_ELBO, TraceMeanField_ELBO, Pred
 from numpyro.distributions import constraints
 from numpyro.distributions.transforms import Transform, AffineTransform, ComposeTransform, ExpTransform
 from numpyro.infer.reparam import TransformReparam
-from numpyro.infer.autoguide import AutoDelta, AutoNormal, AutoMultivariateNormal, AutoLowRankMultivariateNormal
-from numpyro.optim import optax_to_numpyro
+from numpyro.infer.autoguide import AutoDelta, AutoNormal, AutoMultivariateNormal, AutoLowRankMultivariateNormal, AutoBNAFNormal, AutoLaplaceApproximation
+from numpyro.optim import optax_to_numpyro, Minimize
 
 def exact_blr(X, y, lam=1, mu_0=0., a_0=2., b_0=1.):
     # bayesian linear regression
@@ -68,62 +68,113 @@ class QRTransform(Transform):
             raise ValueError("Too few dimensions on input")
         return lax.broadcast_shapes(shape, self.R.shape[:-1])
 
-
 class BayesRegression(object):
-    def __init__(self, rng_key, X, p0=1, with_qr=False, reg_type='linear'):
+    def __init__(self, rng_key, X, linnet, *, p0=1, regtype='linear', with_qr=False):
         self.N, self.D = X.shape
         self.X = X
+        self.linnet = linnet
+        self.params, self.static = eqx.partition(self.linnet, eqx.is_inexact_array)
+        self.vals, self.aux = self.params.tree_flatten()
+
         self.rng_key = rng_key
         self.with_qr = with_qr
         self.p0 = p0
-        self.type = reg_type # type of the rergression problem
+        self.type = regtype # type of the rergression problem
         
         if self.with_qr:
             # use QR decomposition
             self.Q, self.R = jnp.linalg.qr(X)
             self.R_inv = jnp.linalg.inv(self.R)
-        
-    def model(self, obs=None):
-        sigma_sqr = sample('sigma^2', dist.InverseGamma(2., 1.))
-        sigma = deterministic('sigma', jnp.sqrt(sigma_sqr))
-        
-        tau0 = self.p0 / ((self.D - self.p0) * jnp.sqrt(self.N))
-        tau = sample('tau', dist.HalfCauchy(1.))
-            
-        lam = sample('lam', dist.HalfCauchy(1.).expand([self.D]).to_event(1))
 
-        gamma = jnp.sqrt(tau0**2 * tau**2 * lam **2 / (1 + tau0**2 * tau**2 * lam ** 2))
-            
-        if self.with_qr:
-            rt = QRTransform(self.R, self.R_inv)
-            aff = AffineTransform(0., sigma * gamma)
-            ct = ComposeTransform([aff, rt])
-            with handlers.reparam(config={"theta": TransformReparam()}):
-                theta = sample(
-                    'theta', 
-                    dist.TransformedDistribution(dist.Normal(0., 1.).expand([self.D]).to_event(1), ct)
-                )
-
-            deterministic('beta', rt.inv(theta))
-            tmp = self.Q.dot(theta)
-
-        else:
-            aff = AffineTransform(0., sigma * gamma)
-            with handlers.reparam(config={"beta": TransformReparam()}):
-                beta = sample(
-                    'beta', 
-                    dist.TransformedDistribution(dist.Normal(0., 1.).expand([self.D]).to_event(1), aff)
-                )
-            tmp = self.X.dot(beta)
-
-        alpha = sample('alpha', dist.Normal(0., 10.))
-        mu = deterministic('mu', alpha + tmp)
-        
+    def likelihood(self, mu, sigma):
         with plate('data', self.N):
             if self.type == 'linear':
-                sample('obs', dist.Normal(mu, sigma), obs=obs)
+                sample('obs', dist.Normal(mu, sigma))
             elif self.type == 'logistic':
-                sample('obs', dist.Bernoulli(logits=mu), obs=obs)
+                sample('obs', dist.Bernoulli(logits=mu))
+            elif self.type == 'multinomial':
+                sample('obs', dist.Categorical(logits=mu))
+
+    def hyperprior(self, name, sigma, shape):
+        c_sqr = sample(name + '.c^2', dist.InverseGamma(2., 3.))
+        i, j = shape
+        tau = sample(name + '.tau', dist.HalfCauchy(1.).expand([i]).to_event(1))
+        lam = sample(name + '.lam', dist.HalfCauchy(1.).expand([i, j]).to_event(2))
+
+        if self.type == 'linear':
+            tau0 = self.p0 * sigma / ((j - self.p0) * jnp.sqrt(self.N))
+        else:
+            eps = sample(name + '.eps', dist.Exponential(1.))
+            tau0 = eps * self.p0 / (j - self.p0)
+
+        psi = tau0 * jnp.expand_dims(tau, -1) * lam
+        
+        return jnp.sqrt(c_sqr * psi **2 / (c_sqr + psi ** 2))
+
+    def prior(self, name, gamma, shape):
+        if self.with_qr:
+            #TODO: test if it is working
+            rt = QRTransform(self.R, self.R_inv)
+            aff = AffineTransform(0., gamma)
+            ct = ComposeTransform([aff, rt])
+            with handlers.reparam(config={name + "_theta": TransformReparam()}):
+                theta = sample(
+                    name + '_theta', 
+                    dist.TransformedDistribution(dist.Normal(0., 1.).expand(list(shape)).to_event(2), ct)
+                )
+
+            weight = deterministic(name, rt.inv(theta))
+
+        else:
+            aff = AffineTransform(0., gamma)
+            with handlers.reparam(config={name: TransformReparam()}):
+                weight = sample(
+                    name, 
+                    dist.TransformedDistribution(dist.Normal(0., 1.).expand(list(shape)).to_event(2), aff)
+                )
+
+        return weight
+
+    def _register_network_vars(self, sigma):
+        new_vals = ()
+        for l, layer in enumerate(self.vals[0]):
+            lv, l_aux = layer.tree_flatten()
+            new_lv = ()
+            for value, name in zip(lv, l_aux[0]):
+                if value is not None:
+                    if name == 'bias':
+                        new_lv += (sample(f'layer{l}.{name}', dist.Normal(0., 10.).expand(list(value.shape)).to_event(1)),)
+                    else:
+                        gamma = self.hyperprior(f'layer{l}.{name}', sigma, value.shape)
+                        weight = self.prior(f'layer{l}.{name}', gamma, value.shape)
+                        new_lv += (weight,)
+                        if l == 0:
+                            beta = weight
+                        else:
+                            beta = weight @ beta
+                else:
+                    new_lv += (value,)
+
+            new_vals += (layer.tree_unflatten(l_aux, new_lv),)
+
+        deterministic('beta', beta.squeeze())
+
+        vals = (new_vals,) + self.vals[1:]
+        params = self.params.tree_unflatten(self.aux, vals)
+
+        return eqx.combine(params, self.static)
+        
+    def model(self, obs=None):
+        if self.type == 'linear':
+            sigma_sqr = sample('sigma^2', dist.InverseGamma(2., 3.))
+            sigma = deterministic('sigma', jnp.sqrt(sigma_sqr))
+        else:
+            sigma = deterministic('sigma', jnp.ones(1))
+
+        mu = vmap(self._register_network_vars(sigma))(self.X).squeeze()
+
+        with handlers.condition(data={'obs': obs}):
+            self.likelihood(mu, sigma)
     
     def fit(self, data, num_samples=1000, warmup_steps=1000, num_chains=1, summary=False, progress_bar=True):
         self.rng_key, _rng_key = random.split(self.rng_key)
@@ -147,93 +198,54 @@ class BayesRegression(object):
 
         return samples
 
+class SVIRegression(BayesRegression):
 
-class BayesRegressionSVI(object):
-    def __init__(self, rng_key, X, p0=1, with_qr=False, reg_type='linear'):
-        self.N, self.D = X.shape
-        self.X = X
-        self.rng_key = rng_key
-        self.with_qr = with_qr
-        self.p0 = p0
-        self.type = reg_type # type of the rergression problem
+    def hyperprior(self, name, sigma, shape):
+        c_sqr = sample(name + '.c^2', dist.InverseGamma(2., 3.))
+        i, j = shape
+
+        u = sample(name + '.u', dist.Gamma(1/2, 1).expand([i, j + 1]).to_event(2))
+        v = sample(name + '.v', dist.Gamma(1/2, 1).expand([i, j + 1]).to_event(2))
+
+        eps = sample(name + '.eps', dist.Exponential(1.))
+        tau0 = eps * self.p0 / (j - self.p0)
         
-        if self.with_qr:
-            # use QR decomposition
-            self.Q, self.R = jnp.linalg.qr(X)
-            self.R_inv = jnp.linalg.inv(self.R)
+        tau = deterministic(name + '.tau', tau0 * jnp.sqrt(v[:, 0] / u[:, 0]))
+        lam = deterministic(name + '.lam', jnp.expand_dims(tau, -1) * jnp.sqrt(v[:, 1:] / u[:, 1:]))
+
+        psi = tau0 ** 2 * v[:, 1:] * v[:, :1]
+        ksi = u[:, 1:] * u[:, :1]
         
-    def model(self, obs=None):
-        sigma_sqr = sample('sigma^2', dist.InverseGamma(2., 1.))
-        sigma = deterministic('sigma', jnp.sqrt(sigma_sqr))
-        
-        tau0 = self.p0 / ((self.D - self.p0) * jnp.sqrt(self.N))
-        u = sample('u', dist.Gamma(1/2, 1).expand([self.D + 1]).to_event(1))
-        v = sample('v', dist.Gamma(1/2, 1).expand([self.D + 1]).to_event(1))
-        
-        tau = deterministic('tau', tau0 * jnp.sqrt(v[0]/u[0]))
-        lam = deterministic('lam', tau * jnp.sqrt(v[1:]/u[1:]))
+        return jnp.sqrt(c_sqr * psi / (c_sqr * ksi + psi))
 
-        gamma = deterministic('gamma', jnp.sqrt(tau0**2 * v[1:] * v[0] / (u[1:] * u[0] + tau0**2 * v[1:] * v[0])))
-            
-        if self.with_qr:
-            rt = QRTransform(self.R, self.R_inv)
-            aff = AffineTransform(0., sigma * gamma)
-            ct = ComposeTransform([aff, rt])
-            with handlers.reparam(config={"theta": TransformReparam()}):
-                theta = sample(
-                    'theta', 
-                    dist.TransformedDistribution(dist.Normal(0., 1.).expand([self.D]).to_event(1), ct)
-                )
-
-            deterministic('beta', rt.inv(theta))
-            tmp = self.Q.dot(theta)
-
-        else:
-            aff = AffineTransform(0., sigma * gamma)
-            with handlers.reparam(config={"beta": TransformReparam()}):
-                beta = sample(
-                    'beta', 
-                    dist.TransformedDistribution(dist.Normal(0., 1.).expand([self.D]).to_event(1), aff)
-                )
-            tmp = self.X.dot(beta)
-
-        alpha = sample('alpha', dist.Normal(0., 10.))
-        mu = deterministic('mu', alpha + tmp)
-        
-        with plate('data', self.N):
-            if self.type == 'linear':
-                sample('obs', dist.Normal(mu, sigma), obs=obs)
-            elif self.type == 'logistic':
-                sample('obs', dist.Bernoulli(logits=mu), obs=obs)
-
-    def fit(self, data, num_samples=1000, num_steps=1000, num_particles=1, opt_kwargs={'learning_rate': 1e-2}, autoguide=None):
+    def fit(self, data, num_samples=1000, num_steps=1000, num_particles=1, opt_kwargs={'learning_rate': 1e-3}, autoguide=None, rank=2):
         optimizer = optax_to_numpyro(optax.chain(optax.adabelief(**opt_kwargs)))
         model = self.model
 
         if autoguide == 'mean-field':
             guide = AutoNormal(self.model)
-            loss = TraceMeanField_ELBO(num_particles=num_particles)
-        elif autoguide == 'multivaraite':
+        elif autoguide == 'multivariate':
             guide = AutoMultivariateNormal(self.model)
-            loss = Trace_ELBO(num_particles=num_particles)
-        elif autoguide == 'lowrank-multivaraite':
-            guide = AutoLowRankMultivariateNormal(self.model, rank=2)
-            loss = Trace_ELBO(num_particles=num_particles)
+        elif autoguide == 'lowrank-multivariate':
+            guide = AutoLowRankMultivariateNormal(self.model, rank=rank)
+        elif autoguide == 'bnaf-normal':
+            guide = AutoBNAFNormal(self.model)
         else:
             guide = AutoDelta(self.model)
-            loss = Trace_ELBO(num_particles=num_particles)
-
+            
+        loss = Trace_ELBO(num_particles=num_particles)
         self.rng_key, _rng_key = random.split(self.rng_key)
 
         svi = SVI(model, guide, optimizer, loss)
 
         self.results = svi.run(_rng_key, num_steps, obs=data)
-
-        return_sites = ["beta", "sigma", "tau", "lam", "gamma"]
+        
+        return_sites = ["beta", "sigma"]
         pred = Predictive(model, guide=guide, params=self.results.params, num_samples=num_samples, return_sites=return_sites)
+        
         self.samples = pred(_rng_key, obs=data)
 
-        return self.samples, self.results.losses
+        return self.samples
 
 
 class BMRNormalRegression(object):
