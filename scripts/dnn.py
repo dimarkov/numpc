@@ -172,14 +172,14 @@ ResNet50 = partial(ResNet, stage_sizes=[3, 4, 6, 3], block_cls=ResNetBlock)
 def resnet(images, sigma=1., labels=None, subsample_size=None, likelihood_type='normal', train=False):
     n, d, _, _ = images.shape
 
-    nnet = flax_module("nnet", ResNet50(num_classes=10), input_shape=(1, d, d, 1), mutable=["batch_stats"], train=True)
+    nnet = flax_module("nnet", ResNet18(num_classes=10), input_shape=(1, d, d, 1), mutable=["batch_stats"], train=True)
 
     likelihood(nnet, images, labels, sigma, n, subsample_size, likelihood_type, event_dim=3, train=train)
 
 def fitting_and_testing(model, train_ds, test_ds, rng_key, likelihood_type):
     guide = lambda *args, **kwargs: None  # MLE estimate
     opt = optax.chain(
-        optax.adabelief(1e-4)
+        optax.adabelief(1e-3)
     )
     optimizer = numpyro.optim.optax_to_numpyro(opt)
 
@@ -193,7 +193,7 @@ def fitting_and_testing(model, train_ds, test_ds, rng_key, likelihood_type):
     if likelihood_type == 'normal':
         svi_result = svi.run(
             _rng_key, 
-            50000, 
+            10000, 
             train_ds['image'], 
             labels=nn.one_hot(train_ds['label'], n_labels), 
             subsample_size=256,
@@ -203,7 +203,7 @@ def fitting_and_testing(model, train_ds, test_ds, rng_key, likelihood_type):
     elif likelihood_type == 'categorical':
         svi_result = svi.run(
             _rng_key, 
-            50000, 
+            10000, 
             train_ds['image'], 
             labels=train_ds['label'], 
             subsample_size=256,
