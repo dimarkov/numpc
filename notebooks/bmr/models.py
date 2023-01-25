@@ -69,11 +69,11 @@ class QRTransform(Transform):
         return lax.broadcast_shapes(shape, self.R.shape[:-1])
 
 class BayesRegression(object):
-    def __init__(self, rng_key, X, linnet, *, p0=1, regtype='linear', with_qr=False):
+    def __init__(self, rng_key, X, nnet, *, p0=1, regtype='linear', batch_size=None, with_qr=False):
         self.N, self.D = X.shape
         self.X = X
-        self.linnet = linnet
-        self.params, self.static = eqx.partition(self.linnet, eqx.is_inexact_array)
+        self.batch_size = batch_size
+        self.params, self.static = eqx.partition(nnet, eqx.is_inexact_array)
         self.vals, self.aux = self.params.tree_flatten()
 
         self.rng_key = rng_key
@@ -86,14 +86,22 @@ class BayesRegression(object):
             self.Q, self.R = jnp.linalg.qr(X)
             self.R_inv = jnp.linalg.inv(self.R)
 
-    def likelihood(self, mu, sigma):
-        with plate('data', self.N):
+    def likelihood(self, nnet, target, sigma):
+        with plate('data', self.N, subsample_size=self.batch_size):
+            batch_x = subsample(self.X, event_dim=1)
+            mu = vmap(nnet)(batch_x).squeeze()
+
+            if target is not None:
+                batch_y = subsample(target, event_dim=0)
+            else:
+                batch_y = target
+
             if self.type == 'linear':
-                sample('obs', dist.Normal(mu, sigma))
+                sample('obs', dist.Normal(mu, sigma), obs=batch_y)
             elif self.type == 'logistic':
-                sample('obs', dist.Bernoulli(logits=mu))
+                sample('obs', dist.Bernoulli(logits=mu), obs=batch_y)
             elif self.type == 'multinomial':
-                sample('obs', dist.Categorical(logits=mu))
+                sample('obs', dist.Categorical(logits=mu), obs=batch_y)
 
     def hyperprior(self, name, sigma, shape):
         c_sqr = sample(name + '.c^2', dist.InverseGamma(2., 3.))
@@ -143,7 +151,7 @@ class BayesRegression(object):
             for value, name in zip(lv, l_aux[0]):
                 if value is not None:
                     if name == 'bias':
-                        new_lv += (sample(f'layer{l}.{name}', dist.Normal(0., 10.).expand(list(value.shape)).to_event(1)),)
+                        new_lv += (sample(f'layer{l}.{name}', dist.Normal(0., 1.).expand(list(value.shape)).to_event(1)),)
                     else:
                         gamma = self.hyperprior(f'layer{l}.{name}', sigma, value.shape)
                         weight = self.prior(f'layer{l}.{name}', gamma, value.shape)
@@ -171,10 +179,9 @@ class BayesRegression(object):
         else:
             sigma = deterministic('sigma', jnp.ones(1))
 
-        mu = vmap(self._register_network_vars(sigma))(self.X).squeeze()
-
-        with handlers.condition(data={'obs': obs}):
-            self.likelihood(mu, sigma)
+        nnet = self._register_network_vars(sigma)
+        
+        self.likelihood(nnet, obs, sigma)
     
     def fit(self, data, num_samples=1000, warmup_steps=1000, num_chains=1, summary=False, progress_bar=True):
         self.rng_key, _rng_key = random.split(self.rng_key)
