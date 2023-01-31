@@ -128,6 +128,11 @@ class BayesRegression(object):
             self.Q, self.R = jnp.linalg.qr(X)
             self.R_inv = jnp.linalg.inv(self.R)
 
+    def set_input(self, X, batch_size=None):
+        self.N, self.D = X.shape
+        self.X = X
+        self.batch_size = batch_size
+
     def likelihood(self, nnet, target, sigma):
         with plate('data', self.N, subsample_size=self.batch_size):
             batch_x = subsample(self.X, event_dim=1)
@@ -163,20 +168,18 @@ class BayesRegression(object):
         else:
             return jnp.ones(1)
 
-    def prior(self, name, sigma, gamma, loc=0.):
-        if self.with_qr:
-            #TODO: test if it is working
-            raise NotImplementedError
-            # rt = QRTransform(self.R, self.R_inv)
-            # aff = AffineTransform(0., gamma)
-            # ct = ComposeTransform([aff, rt])
-            # with handlers.reparam(config={name + "_theta": TransformReparam()}):
-            #     theta = sample(
-            #         name + '_theta', 
-            #         dist.TransformedDistribution(dist.Normal(0., 1.).expand(list(shape)).to_event(2), ct)
-            #     )
+    def prior(self, name, sigma, gamma, loc=0., with_qr=False):
+        if with_qr:
+            rt = QRTransform(self.R, self.R_inv)
+            aff = AffineTransform(loc, sigma * gamma)
+            ct = ComposeTransform([aff, rt])
+            with handlers.reparam(config={name + "_theta": TransformReparam()}):
+                theta = sample(
+                    name + '_theta', 
+                    dist.TransformedDistribution(dist.Normal(0., 1.).expand(list(gamma.shape)).to_event(2), ct)
+                )
 
-            # weight = deterministic(name, rt.inv(theta))
+            weight = deterministic(name, rt.inv(theta))
 
         else:
             aff = AffineTransform(loc, sigma * gamma)
@@ -205,9 +208,15 @@ class BayesRegression(object):
                             gamma = jnp.ones(value.shape)
                         
                         if l + 1 < L:
-                            weight = self.prior(f'layer{l}.{name}', 1., gamma)
+                            if l == 0:
+                                weight = self.prior(f'layer{l}.{name}', 1., gamma, with_qr=self.with_qr)
+                            else:
+                                weight = self.prior(f'layer{l}.{name}', 1., gamma)
                         else:
-                            weight = self.prior(f'layer{l}.{name}', sigma, gamma)
+                            if l == 0:
+                                weight = self.prior(f'layer{l}.{name}', sigma, gamma, with_qr=self.with_qr)
+                            else:
+                                weight = self.prior(f'layer{l}.{name}', sigma, gamma)
                         
                         new_lv += (weight,)
                         if l == 0:
@@ -272,11 +281,12 @@ class SVIRegression(BayesRegression):
         *,
         optimizer=adan,
         p0=1, 
-        regtype='linear', 
+        regtype='linear',
+        batch_size=None, 
         with_qr=False, 
         with_hyperprior=True,
     ):
-        super().__init__(rng_key, X, nnet, p0=p0, regtype=regtype, with_qr=with_qr, with_hyperprior=with_hyperprior)
+        super().__init__(rng_key, X, nnet, p0=p0, regtype=regtype, batch_size=batch_size, with_qr=with_qr, with_hyperprior=with_hyperprior)
         self.optimizer = optimizer
  
     def hyperprior(self, name, shape):
