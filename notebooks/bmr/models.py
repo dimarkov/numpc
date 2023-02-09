@@ -4,6 +4,7 @@ import numpyro.distributions as dist
 import optax
 import equinox as eqx
 
+from collections import defaultdict
 from functools import partial
 from jax.scipy.special import gammaln
 from jax import nn, lax, random, vmap, device_put, linearize
@@ -104,12 +105,16 @@ class BayesRegression(object):
         regtype='linear', 
         batch_size=None, 
         with_qr=False, 
-        with_hyperprior=True
+        with_hyperprior=True,
+        **kwargs
         ):
 
         self.N, self.D = X.shape
         self.X = X
         self.batch_size = batch_size
+
+        self.nnet = nnet
+        self.layers = self.get_linear_layers(nnet)
         self.params, self.static = eqx.partition(nnet, eqx.is_inexact_array)
         self.vals, self.aux = self.params.tree_flatten()
 
@@ -119,9 +124,14 @@ class BayesRegression(object):
         self.p0 = p0
         self.type = regtype # type of the rergression problem
 
+        # prior weight uncertanty
+        self.sigma0 = kwargs.pop('sigma0', 1.)
+
         # parameters for sigma's gamma prior
-        self.a0 = 2.
-        self.b0 = 2.
+        self.a0 = kwargs.pop('a0', 2.)
+        self.b0 = kwargs.pop('b0', 2.)
+
+        self.gamma = defaultdict(lambda: None)
         
         if self.with_qr:
             # use QR decomposition
@@ -148,6 +158,7 @@ class BayesRegression(object):
             elif self.type == 'logistic':
                 sample('obs', dist.Bernoulli(logits=mu), obs=batch_y)
             elif self.type == 'multinomial':
+                probs = deterministic('probs', nn.softmax(mu, -1))
                 sample('obs', dist.Categorical(logits=mu), obs=batch_y)
 
     def hyperprior(self, name, shape, use=True):
@@ -162,7 +173,7 @@ class BayesRegression(object):
 
             psi = tau0 * jnp.expand_dims(tau, -1) * lam
             
-            gamma = deterministic(name + '.gamma^2', jnp.sqrt(c_sqr * psi ** 2 / (c_sqr + psi ** 2)))
+            gamma = deterministic(name + '.gamma', jnp.sqrt(c_sqr * psi ** 2 / (c_sqr + psi ** 2)))
 
             return gamma
         else:
@@ -191,50 +202,52 @@ class BayesRegression(object):
 
         return weight
 
-    def _register_network_vars(self, sigma):
-        new_vals = ()
-        L = len(self.vals[0])
-        for l, layer in enumerate(self.vals[0]):
-            lv, l_aux = layer.tree_flatten()
-            new_lv = ()
-            for value, name in zip(lv, l_aux[0]):
-                if value is not None:
-                    if name == 'bias':
-                        new_lv += (sample(f'layer{l}.{name}', dist.Normal(0., 1.).expand(list(value.shape)).to_event(1)),)
-                    else:
-                        if self.with_hyperprior:
-                            gamma = self.hyperprior(f'layer{l}.{name}', value.shape)
-                        else:
-                            gamma = jnp.ones(value.shape)
-                        
-                        if l + 1 < L:
-                            if l == 0:
-                                weight = self.prior(f'layer{l}.{name}', 1., gamma, with_qr=self.with_qr)
-                            else:
-                                weight = self.prior(f'layer{l}.{name}', 1., gamma)
-                        else:
-                            if l == 0:
-                                weight = self.prior(f'layer{l}.{name}', sigma, gamma, with_qr=self.with_qr)
-                            else:
-                                weight = self.prior(f'layer{l}.{name}', sigma, gamma)
-                        
-                        new_lv += (weight,)
-                        if l == 0:
-                            beta = weight
-                        else:
-                            beta = weight @ beta
-                else:
-                    new_lv += (value,)
+    def get_linear_layers(self, m):
+        is_linear = lambda x: isinstance(x, eqx.nn.Linear)
+        return [x for x in jtu.tree_leaves(m, is_leaf=is_linear) if is_linear(x)]
 
-            new_vals += (layer.tree_unflatten(l_aux, new_lv), )
+    def _register_network_vars(self, sigma):
+        L = len(self.layers)
+        new_layers = []
+        for l, m in enumerate(self.layers):
+            weight, bias = m.weight, m.bias
+            if bias is not None:
+                bias = sample(f'layer{l}.bias', dist.Normal(0., 1.).expand(list(bias.shape)).to_event(1))
+                m = eqx.tree_at(lambda m: m.bias, m, bias)
+            
+            if self.with_hyperprior:
+                gamma = self.hyperprior(f'layer{l}.weight', weight.shape)
+            else:
+                if self.gamma[f'layer{l}.weight'] is not None:
+                    gamma = self.gamma[f'layer{l}.weight']
+                else:
+                    gamma = jnp.ones(weight.shape)
+            
+            if l + 1 < L:
+                if l == 0:
+                    weight = self.prior(f'layer{l}.weight', 1., gamma, with_qr=self.with_qr)
+                else:
+                    weight = self.prior(f'layer{l}.weight', 1., gamma)
+            else:
+                if l == 0:
+                    weight = self.prior(f'layer{l}.weight', sigma, gamma, with_qr=self.with_qr)
+                else:
+                    weight = self.prior(f'layer{l}.weight', sigma, gamma)
+            
+            m = eqx.tree_at(lambda m: m.weight, m, weight)
+            new_layers.append(m)
+            
+            if l == 0:
+                beta = weight
+            else:
+                beta = weight @ beta
 
         deterministic('beta', beta.squeeze())
 
-        vals = (new_vals,) + self.vals[1:]
-        params = self.params.tree_unflatten(self.aux, vals)
+        nnet = eqx.tree_at(self.get_linear_layers, self.nnet, new_layers)
 
-        return eqx.combine(params, self.static)
-        
+        return nnet
+
     def model(self, obs=None):
         if self.type == 'linear':
             sigma_sqr_inv = sample('sigma^-2', dist.Gamma(self.a0, self.b0))
@@ -285,8 +298,19 @@ class SVIRegression(BayesRegression):
         batch_size=None, 
         with_qr=False, 
         with_hyperprior=True,
+        **kwargs
     ):
-        super().__init__(rng_key, X, nnet, p0=p0, regtype=regtype, batch_size=batch_size, with_qr=with_qr, with_hyperprior=with_hyperprior)
+        super().__init__(
+            rng_key, 
+            X, 
+            nnet, 
+            p0=p0, 
+            regtype=regtype, 
+            batch_size=batch_size, 
+            with_qr=with_qr, 
+            with_hyperprior=with_hyperprior,
+            **kwargs
+        )
         self.optimizer = optimizer
  
     def hyperprior(self, name, shape):
@@ -304,7 +328,7 @@ class SVIRegression(BayesRegression):
         psi = tau0 ** 2 * v[:, 1:] * v[:, :1]
         ksi = u[:, 1:] * u[:, :1]
 
-        gamma = deterministic(name + '.gamma^2', jnp.sqrt(psi / (ksi + c_sqr_inv * psi)))
+        gamma = deterministic(name + '.gamma', jnp.sqrt(psi / (ksi + c_sqr_inv * psi)))
         
         return gamma
 
@@ -365,8 +389,10 @@ class BMRRegression(SVIRegression):
         optimizer=adan, 
         p0=1, 
         regtype='linear', 
-        with_qr=False, 
-        posterior='normal'
+        with_qr=False,
+        batch_size=None, 
+        posterior='normal',
+        **kwargs
         ):
         super().__init__(
             rng_key, 
@@ -375,14 +401,16 @@ class BMRRegression(SVIRegression):
             optimizer=optimizer, 
             p0=p0, 
             regtype=regtype, 
-            with_qr=with_qr, 
-            with_hyperprior=False
+            with_qr=with_qr,
+            batch_size=batch_size, 
+            with_hyperprior=False,
+            **kwargs
         )
         self.posterior = posterior
+        self.ktied_rank = kwargs.pop('ktied_rank', 2)
 
-
-    def prior(self, name, sigma, gamma, value=0.):
-        if self.with_qr:
+    def prior(self, name, sigma, gamma, value=0., with_qr=False):
+        if with_qr:
             raise NotImplementedError
         else:
             aff = AffineTransform(value, sigma)
@@ -393,6 +421,18 @@ class BMRRegression(SVIRegression):
                 )
 
         return weight
+    
+    def ktied_weight_posterior(self, name, sigma, shape):
+        if self.with_qr:
+            raise NotImplementedError
+        else:
+            i, j = shape
+            rank = self.ktied_rank
+            scale_u = param(name + '.scale_u', jnp.ones((i, rank))/jnp.sqrt(10 * rank))
+            scale_v = param(name + '.scale_v', jnp.ones((rank, j))/jnp.sqrt(10 * rank))
+            scale = deterministic(name + '.scale' + name, jnp.abs(scale_u @ scale_v))
+            loc = param(name + '.loc', lambda rng_key: random.normal(rng_key, shape=shape) / 10)
+            sample(name + '_base', dist.Normal(loc/sigma, scale).to_event(2))
 
     def normal_weight_posterior(self, name, sigma, shape):
         if self.with_qr:
@@ -413,8 +453,13 @@ class BMRRegression(SVIRegression):
     def get_weight_posterior(self, name, sigma, shape):
         if self.posterior == 'normal':
             return self.normal_weight_posterior(name, sigma, shape)
+
+        elif self.posterior == 'ktied-normal':
+            return self.ktied_weight_posterior(name, sigma, shape)
+
         elif self.posterior == 'multivariate':
             return self.multivariate_weight_posterior(name, sigma, shape)
+
         else:
             raise NotImplementedError
 
@@ -439,31 +484,34 @@ class BMRRegression(SVIRegression):
                     if name == 'bias':
                         loc = param(f'layer{l}.{name}.loc', lambda rng_key: random.normal(rng_key, shape=value.shape) / 10)
                         scale = param(f'layer{l}.{name}.scale', jnp.ones(value.shape)/10, constraint=constraints.softplus_positive)
-                        sample(f'layer{l}.{name}_base', dist.Normal(loc, scale).to_event(1))
+                        sample(f'layer{l}.{name}', dist.Normal(loc, scale).to_event(1))
                     else:
                         if l + 1 < L:
                             self.get_weight_posterior(f'layer{l}.{name}', 1., value.shape)
                         else:
                             self.get_weight_posterior(f'layer{l}.{name}', sigma, value.shape) 
 
-    def ΔF(self, mu, P, gamma):
-        if self.posterior == 'normal':
-            return self.ΔF_mf(mu, P, gamma)
+    def ΔF(self, mu, P, gamma, sigma_sqr=1):
+        if 'normal' in self.posterior:
+            return self.ΔF_mf(mu, P, gamma, sigma_sqr)
         elif self.posterior == 'multivariate':
-            return self.ΔF_mv(mu, P, gamma)
+            return self.ΔF_mv(mu, P, gamma, sigma_sqr)
         else:
             raise NotImplementedError
 
-    def ΔF_mv(self, mu, P, gamma):
-        M = jnp.diag(gamma) @ P + jnp.diag(1 - gamma)
+    def ΔF_mv(self, mu, P, gamma_sqr, sigma_sqr):
+
+        M = jnp.diag(gamma_sqr) @ P + jnp.diag(1 - gamma_sqr/sigma_sqr)
 
         _, logdet = jnp.linalg.slogdet(M)
         df = -logdet/2
 
         _, logdet = jnp.linalg.slogdet(P)
         df += logdet / 2
+
+        df += jnp.sum(jnp.log(sigma_sqr))
         
-        t_P = P + jnp.diag(1/gamma - 1)
+        t_P = P + jnp.diag(1/gamma_sqr - 1/sigma_sqr)
         t_mu = jnp.linalg.solve(t_P, P @ mu)
 
         df -= mu.T @ P @ mu / 2
@@ -471,14 +519,14 @@ class BMRRegression(SVIRegression):
         
         return df, t_mu, t_P
 
-    def ΔF_mf(self, mu, pi, gamma):
-        M = gamma * pi + 1 - gamma
+    def ΔF_mf(self, mu, pi, gamma_sqr, sigma_sqr):
+        M = gamma_sqr * (pi - 1/sigma_sqr) + 1
 
         df = -jnp.log(M).sum() / 2
 
-        df += jnp.log(pi).sum() / 2
+        df += (jnp.log(pi) + jnp.log(sigma_sqr)).sum() / 2
         
-        t_pi = pi + 1/gamma - 1
+        t_pi = pi + 1/gamma_sqr - 1/sigma_sqr
         t_mu = pi * mu / t_pi
 
         df -= jnp.inner(pi * mu, mu) / 2
@@ -491,27 +539,44 @@ class BMRRegression(SVIRegression):
         if len(invert) == 0:
             if self.posterior == 'normal':
                 params = self.results.params
-                pi = 1/params[name + '.scale'] ** 2
+                pi = 1 / params[name + '.scale'] ** 2
                 mu = params[name + '.loc']
                 return (mu, pi)
+
+            elif self.posterior == 'ktied-normal':
+                params = self.results.params
+                scale_u = params[name + '.scale_u']
+                scale_v = params[name + '.scale_v']
+                scale = jnp.abs(scale_u @ scale_v)
+                pi = 1 / scale ** 2
+                mu = params[name + '.loc']
+                return (mu, pi)
+
             elif self.posterior == 'multivariate':
                 params = self.results.params
                 mu = params[name + '.loc']
                 L_inv = vmap(jnp.linalg.inv)(params[name + '.scale'])
                 P = jnp.matmul(L_inv.transpose((0, -1, -2)), L_inv)
                 return (mu, P)
+
             else:
                 raise NotImplementedError
+        
         else:
             if self.posterior == 'normal':
                 deterministic(f'{name}.loc', invert[0])
                 deterministic(f'{name}.scale',  1/jnp.sqrt(invert[1]))
+            
+            elif self.posterior == 'ktied-normal':
+                deterministic(f'{name}.loc', invert[0])
+                deterministic(f'{name}.scale',  1/jnp.sqrt(invert[1]))
+
             elif self.posterior == 'multivariate':
                 deterministic(f'{name}.loc', invert[0])
                 deterministic(f'{name}.scale', vmap(lambda x: jnp.linalg.inv(jnp.linalg.cholesky(x)).T)(invert[1]))
+            
             else:
                 raise NotImplementedError
-            return None
 
     def pruning(self):
         for l, layer in enumerate(self.vals[0]):
@@ -520,18 +585,24 @@ class BMRRegression(SVIRegression):
             for value, name in zip(lv, l_aux[0]):
                 if value is not None:
                     if name == 'weight':
-                        gamma = deterministic(f'layer{l}.{name}.gamma', self.hyperprior(f'layer{l}.{name}', value.shape))
-                        mu_n, P_n = self.sufficient_stats(f'layer{l}.{name}')
-                        log_prob, t_mu, t_P = vmap(self.ΔF)(mu_n, P_n, gamma)
+                        key = f'layer{l}.{name}'
+                        gamma = self.hyperprior(key, value.shape)
+                        mu_n, P_n = self.sufficient_stats(key)
+                        if self.gamma[f'layer{l}.{name}'] is not None:
+                            sigma_sqr = jnp.square(self.gamma[key])
+                        else:
+                            sigma_sqr = self.sigma0 * jnp.ones_like(gamma)
+                        
+                        log_prob, t_mu, t_P = vmap(self.ΔF)(mu_n, P_n, jnp.square(gamma), sigma_sqr)
                         factor(f'layer{l}.{name}.log_prob', log_prob.sum())
-                        self.sufficient_stats(f'layer{l}.{name}', invert=[t_mu, t_P])
+                        self.sufficient_stats(key, invert=[t_mu, t_P])
                     
     def fit(self, data, num_samples=1000, num_steps=1000, num_particles=10, progress_bar=True, opt_kwargs={'learning_rate': 1e-3}):
         optimizer = optax_to_numpyro(optax.chain(self.optimizer(**opt_kwargs)))
         model = self.model
         guide = self.guide
 
-        if self.posterior == 'normal':
+        if 'normal' in self.posterior:
             loss = TraceMeanField_ELBO(num_particles=num_particles)
         else:
             loss = TraceGraph_ELBO(num_particles=num_particles)
@@ -550,11 +621,8 @@ class BMRRegression(SVIRegression):
         self.rng_key, _rng_key = random.split(self.rng_key)
         self.samples = pred(_rng_key, obs=data)
         self.samples.update(samples)
-        
-        return self.samples
 
-    def bmr(self, autoguide, num_steps=1000, num_particles=10, rank=2, progress_bar=True, opt_kwargs={'learning_rate': 1e-3}):
-        num_samples = 1000
+    def bmr(self, autoguide, num_steps=1000, num_particles=10, num_samples=1000, progress_bar=True, opt_kwargs={'learning_rate': 1e-3}, **kwargs):
         optimizer = optax_to_numpyro(optax.chain(self.optimizer(**opt_kwargs)))
 
         if autoguide == 'mean-field':
@@ -564,6 +632,7 @@ class BMRRegression(SVIRegression):
             guide = AutoMultivariateNormal(self.pruning)
             loss = TraceGraph_ELBO(num_particles=num_particles)
         elif autoguide == 'lowrank-multivariate':
+            rank = kwargs.pop('rank', 2)
             guide = AutoLowRankMultivariateNormal(self.pruning, rank=rank)
             loss = TraceGraph_ELBO(num_particles=num_particles)
         else:
@@ -573,21 +642,46 @@ class BMRRegression(SVIRegression):
         self.rng_key, _rng_key = random.split(self.rng_key)
         svi = SVI(self.pruning, guide, optimizer, loss)
 
-        results = svi.run(_rng_key, num_steps, progress_bar=progress_bar)
+        results = svi.run(_rng_key, num_steps, progress_bar=progress_bar, stable_update=True)
 
         pred = Predictive(self.pruning, guide=guide, params=results.params, num_samples=num_samples)
 
         self.rng_key, _rng_key = random.split(self.rng_key)
         samples = pred(_rng_key)
 
+        for key in samples:
+            if 'gamma' in key:
+                s = key.split('.')
+                s = s[0] + '.' + s[1]
+                self.gamma[s] = jnp.sqrt(jnp.square(samples[key]).mean(0))
+
         loc_params = self.results.params.copy()
+        extra = {}
         for key in loc_params:
             if 'weight' in key:
-                loc_params[key] = samples[key].mean(0)
-
-        self.rng_key, _rng_key = random.split(self.rng_key)
-        samples = Predictive(self.guide, params=loc_params, num_samples=num_samples)(_rng_key)
+                if self.posterior == 'ktied-normal':
+                    try:
+                        loc_params[key] = samples[key].mean(0)
+                    except:
+                        s = key.split('_')[0]
+                        extra[s] = samples[s].mean(0)
+                else:
+                    loc_params[key] = samples[key].mean(0)
         
+        loc_params.update(extra)
+
+        if self.posterior == 'ktied-normal':
+            self.posterior = 'normal'
+            self.rng_key, _rng_key = random.split(self.rng_key)
+            pred = Predictive(self.guide, params=loc_params, num_samples=num_samples)
+            samples = pred(_rng_key)
+            self.posterior = 'ktied-normal'
+
+        else:
+            self.rng_key, _rng_key = random.split(self.rng_key)
+            pred = Predictive(self.guide, params=loc_params, num_samples=num_samples)
+            samples = pred(_rng_key)
+
         self.rng_key, _rng_key = random.split(self.rng_key)
         self.samples = Predictive(self.model, posterior_samples=samples)(_rng_key)
         self.samples.update(samples)
