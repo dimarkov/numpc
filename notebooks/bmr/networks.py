@@ -2,6 +2,7 @@ import math
 from typing import Optional, Callable, Sequence, List
 
 import jax
+import jax.numpy as jnp
 import jax.nn as jnn
 import jax.random as jrandom
 from jaxtyping import Array
@@ -39,6 +40,7 @@ class MLP(Module):
     out_size: int = static_field()
     width_size: int = static_field()
     depth: int = static_field()
+    use_bias: bool = static_field()
 
     def __init__(
         self,
@@ -70,13 +72,16 @@ class MLP(Module):
         super().__init__(**kwargs)
         keys = jrandom.split(key, depth + 1)
         layers = ()
+
+        bias = int(use_bias)
+
         if depth == 0:
-            layers += (Linear(in_size, out_size, use_bias=use_bias, key=keys[0]), )
+            layers += (Linear(in_size + bias, out_size, use_bias=False, key=keys[0]), )
         else:
-            layers += (Linear(in_size, width_size, use_bias=use_bias, key=keys[0]), )
+            layers += (Linear(in_size + bias, width_size, use_bias=False, key=keys[0]), )
             for i in range(depth - 1):
-                layers += (Linear(width_size, width_size, use_bias=use_bias, key=keys[i + 1]), )
-            layers += (Linear(width_size, out_size, use_bias=use_bias, key=keys[-1]), )
+                layers += (Linear(width_size + bias, width_size, use_bias=False, key=keys[i + 1]), )
+            layers += (Linear(width_size + bias, out_size, use_bias=False, key=keys[-1]), )
         
         self.layers = layers
         self.in_size = in_size
@@ -85,6 +90,7 @@ class MLP(Module):
         self.depth = depth
         self.activation = activation
         self.final_activation = final_activation
+        self.use_bias = use_bias
 
     def __call__(
         self, x: Array, *, key: Optional["jax.random.PRNGKey"] = None
@@ -100,8 +106,13 @@ class MLP(Module):
         A JAX array with shape `(out_size,)`.
         """
         for layer in self.layers[:-1]:
+            if self.use_bias:
+                x = jnp.pad(x, (0, 1), constant_values=1.)
             x = layer(x)
             x = self.activation(x)
+
+        if self.use_bias:
+            x = jnp.pad(x, (0, 1), constant_values=1.)
         x = self.layers[-1](x)
         x = self.final_activation(x)
         return x
