@@ -7,8 +7,8 @@ import jax.nn as jnn
 import jax.random as jrandom
 from jaxtyping import Array
 
-from equinox.module import Module, static_field
 from equinox.nn import Linear
+from equinox import Module, static_field
 
 from flax import linen as fnn
 
