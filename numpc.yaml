@@ -1,18 +1,21 @@
 name: numpc
 channels:
   - conda-forge
+  - nvidia
   - defaults
 dependencies:
   - jax
   - seaborn
   - matplotlib
-  - jupyter
+  - ipykernel
   - ipywidgets
+  - pip
   - pip:
     - diffrax
     - equinox
     - optax
-    - tensorflow-cpu
-    - tensorflow-datasets==4.8.3
     - flax
     - numpyro
+    - tf-nightly-cpu
+    - tfp-nightly
+    - tensorflow-datasets
