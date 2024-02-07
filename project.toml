@@ -1,0 +1,27 @@
+[project]
+name = "numpc"
+version = "0.1.0"
+description = "Bayesian predictive coding networks with jax and numpyro
+"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {file = "LICENSE.txt"}
+authors = [
+  {name = "dimarkov", email = "5038100+dimarkov@users.noreply.github.com" }
+]
+
+dependencies = [
+  "jax",
+  "numpyro",
+  "equinox"
+]
+
+[project.urls] 
+"Source" = "https://github.com/dimarkov/numpc"
+
+[build-system]
+requires = ["setuptools>=68.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
